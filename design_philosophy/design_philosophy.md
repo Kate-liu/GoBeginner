@@ -1,4 +1,4 @@
-# DesignPhilosophy
+# Design Philosophy
 
 ## 显示设计哲学示例
 
