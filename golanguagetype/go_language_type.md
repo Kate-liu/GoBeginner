@@ -533,6 +533,663 @@ Go 的原生数值类型有三类：整型、浮点型和复数型。
 
 
 
+## 字符串类型 
+
+字符串类型，是现代编程语言中**最常用的数据类型之一**，多数主流编程语言都提供了对这个类型的原生支持，少数没有提供原生字符串的类型的主流语言（比如 C 语言）也通过其他形式提供了对字符串的支持。 
+
+对于这样在日常开发中高频使用的基本数据类型，要给予更多的关注。
+
+### 原生支持字符串有什么好处？ 
+
+Go 是站在巨人的肩膀上成长起来的现代编程语言。它继承了前辈语言的优 点，又改进了前辈语言中的不足。这其中一处就体现在 Go 对字符串类型的原生支持上。 
+
+#### C 语言对字符串的支持
+
+这样的设计会有什么好处呢？作为对比，先来看看前辈语言之一的 C 语言对字符串的支持情况。 
+
+C 语言没有提供对字符串类型的原生支持，也就是说，C 语言中并没有“字符串”这个数据类型。
+
+在 C 语言中，字符串是以字符串字面值或以’\0’结尾的字符类型数组来呈现 的，比如下面代码：
+
+```c
+#define GO_SLOGAN "less is more"
+const char * s1 = "hello, gopher"
+char s2[] = "I love go"
+```
+
+这样定义的非原生字符串在使用过程中会有很多问题，比如：
+
+- 不是原生类型，编译器不会对它进行类型校验，导致类型安全性差； 
+- 字符串操作时要时刻考虑结尾的’\0’，防止缓冲区溢出； 
+- 以字符数组形式定义的“字符串”，它的值是可变的，在并发场景中需要考虑同步问题； 
+- 获取一个字符串的长度代价较大，通常是 O(n) 时间复杂度； 
+- C 语言没有内置对非 ASCII 字符（如中文字符）的支持。
+
+这些问题都大大加重了开发人员在使用字符串时的心智负担。于是，Go 设计者们选择了原 生支持字符串类型。
+
+
+
+#### Go 语言对字符串的支持
+
+在 Go 中，字符串类型为 string。
+
+Go 语言通过 string 类型统一了对“字符串”的抽象。 这样无论是**字符串常量**、**字符串变量**或是代码中出现的**字符串字面值**，它们的类型都被统一设置为 string，比如上面 C 代码换成等价的 Go 代码是这样的：
+
+```go
+// go 对字符串的支持
+const (
+   GO_SLOGAN = "less is more"  // GO_SLOGAN是string类型常量
+   s1        = "hello, gopher" // s1是string类型常量
+)
+
+var s2 = "I love go" // s2是string类型变量
+```
+
+Go 原生支持 string 的做法是对前辈语言的改进，这样的设计到底有哪些优秀的性质，会带来什么好处呢？ 
+
+#### string 类型的数据不可变
+
+第一点：**string 类型的数据是不可变的**，提高了字符串的**并发安全性和存储利用率**。 
+
+Go 语言规定，字符串类型的值在它的生命周期内是不可改变的。这就是说，如果声明了一个字符串类型的变量，那是无法通过这个变量改变它对应的字符串值的，但这并不是说不能为一个字符串类型变量进行二次赋值。 
+
+什么意思呢？看看下面的代码就好理解了：
+
+```go
+// string 类型的数据是不可变的
+var s string = "hello"
+s[0] = 'k'   // 错误： 字符串的内容是不可改变的(cannot assign to s[0] (strings are immutable))
+s = "gopher" // ok
+```
+
+在这段代码中，声明了一个字符串类型变量 s。当试图通过下标方式把这个字符串 的第一个字符由 h 改为 k 的时候，会收到编译器错误的提示：字符串是不可变的。
+
+但仍可以像最后一行代码那样，为变量 s 重新赋值为另外一个字符串。 
+
+Go 这样的“字符串类型数据不可变”的性质给开发人员带来的最大好处，就是不用再 担心字符串的并发安全问题。这样，Go 字符串可以被多个 Goroutine（Go 语言的轻量级用户线程）共享，开发者不用因为担心并发安全问题，使用会带来一定开销的同步机制。
+
+另外，也由于字符串的不可变性，针对同一个字符串值，无论它在程序的几个位置被使用，Go 编译器只需要为它分配一块存储就好了，大大提高了存储利用率。
+
+#### string 类型的数据没有结尾’\0’
+
+第二点：**没有结尾’\0’**，而且**获取长度的时间复杂度是常数时间**，消除了获取字符串长度的开销。
+
+在 C 语言中，获取一个字符串的长度可以调用标准库的 strlen 函数，这个函数的实现原理是遍历字符串中的每个字符并做计数，直到遇到字符串的结尾’\0’停止。
+
+显然这是一个线性时间复杂度的算法，执行时间与字符串中字符个数成正比。并且，它存在一个约束， 那就是传入的字符串必须有结尾’\0’，结尾’\0’是字符串的结束标志。如果使用过 C 语言，想必也吃过字符串结尾’\0’的亏。 
+
+Go 语言修正了这个缺陷，Go 字符串中没有结尾’\0’，获取字符串长度更不需要结尾’\0’作为结束标志。
+
+并且，Go 获取字符串长度是一个常数级时间复杂度，无论字符串中字符个数有多少，都可以快速得到字符串的长度值。
+
+#### string 类型的数据所见即所得
+
+第三点：**原生支持“所见即所得”的原始字符串**，大大降低构造多行字符串时的心智负担。 
+
+如果要在 C 语言中构造多行字符串，一般就是两个方法：要么使用多个字符串的自然拼接，要么需要结合续行符""。但因为有转义字符的存在，很难控制好格式。
+
+Go 语言就简单多了，通过一对反引号原生支持构造“所见即所得”的原始字符串（Raw String）。
+
+而且，Go 语言原始字符串中的任意转义字符都不会起到转义的作用。比如下面这段代码：
+
+```go
+// string 类型的数据所见即所得
+var s string = `         
+            ,_---~~~~~----._
+   _,,_,*^____      _____*g*\"*,--,
+   / __/ /'     ^.  /      \ ^@q   f
+  [  @f | @))    |  | @))   l  0 _/
+   \/   \~____ / __ \_____/     \
+   |           _l__l_           I
+   }          [______]          I
+   ]            | | |           |
+   ]             ~ ~            |
+   |                            |
+   |                            |`
+
+fmt.Println(s)
+```
+
+字符串变量 s 被赋值了一个由一对反引号包裹的 Gopher 图案。这个 Gopher 图案由诸多 ASCII 字符组成，其中就包括了转义字符。
+
+这个时候，如果通过 Println 函数输出这个字符串，得到的图案和上面的图案并无二致。
+
+#### string 类型的数据支持非 ASCII 字符
+
+第三点：**对非 ASCII 字符提供原生支持**，消除了源码在不同环境下显示乱码的可能。 
+
+Go 语言源文件默认采用的是 Unicode 字符集，Unicode 字符集是目前市面上最流行的字符集，它囊括了几乎所有主流非 ASCII 字符（包括中文字符）。
+
+Go 字符串中的每个字符都是一个 Unicode 字符，并且这些 Unicode 字符是以 UTF-8 编码格式存储在内存当中的。 
+
+
+
+### Go 字符串的组成 
+
+Go 语言在看待 Go 字符串组成这个问题上，有两种视角。
+
+一种是**字节视角**，也就是和所有其它支持字符串的主流语言一样，Go 语言中的字符串值也是一个可空的字节序列，字节序列中的字节个数称为该字符串的长度。一个个的字节只是孤立数据，不表意。 
+
+比如在下面代码中，输出了字符串中的每个字节，以及整个字符串的长度：
+
+```go
+// 字符串的组成
+var s = "中国人"
+fmt.Println("the character count in s is", utf8.RuneCountInString(s)) // 3
+
+for _, c := range s {
+   fmt.Printf("0x%x ", c) // 0x4e2d 0x56fd 0x4eba
+}
+fmt.Printf("\n")
+```
+
+在这段代码中，输出了字符串中的字符数量，也输出了这个字符串中的每个字符。
+
+Go 采用的是 Unicode 字符集，每个字符都是一个 Unicode 字符，那么这里输出的 0x4e2d、0x56fd 和 0x4eba 就应该是某种 Unicode 字符的表示了。
+
+以 0x4e2d 为例，它是汉字“中”在 Unicode 字符集表中的**码点（Code Point）**。 
+
+那么，什么是 Unicode 码点呢？ 
+
+- Unicode 字符集中的每个字符，都被分配了统一且唯一的字符编号。
+- 所谓 Unicode 码 点，就是指将 Unicode 字符集中的所有字符“排成一队”，字符在这个“队伍”中的位 次，就是它在 Unicode 字符集中的码点。
+- 也就说，一个码点唯一对应一个字符。“码 点”的概念和 rune 类型有很大关系。
+
+### rune 类型
+
+Go 使用 rune 这个类型来表示一个 Unicode 码点。
+
+rune 本质上是 int32 类型的别名类型，它**与 int32 类型是完全等价的**，在 Go 源码中可以看到它的定义是这样的：
+
+```go
+// builtin/builtin.go
+type rune = int32
+```
+
+由于一个 Unicode 码点唯一对应一个 Unicode 字符。
+
+所以可以说，**一个 rune 实例就是一个 Unicode 字符，一个 Go 字符串也可以被视为 rune 实例的集合**。
+
+### 字符字面值
+
+可以通过字符字面值来**初始化一个 rune 变量**。
+
+在 Go 中，字符字面值有多种表示法，最常见的是通过**单引号括起的字符字面值**，比如：
+
+```go
+// 字符字面值 之 单引号
+'a'  // ASCII字符
+'中'  // Unicode字符集中的中文字符
+'\n' // 换行字符
+'\'' // 单引号字符
+```
+
+还可以使用 **Unicode 专用的转义字符\u 或\U 作为前缀**，来表示一个 Unicode 字符，比如：
+
+```go
+// 字符字面值 之 unicode 专用的转义字符作为前缀
+'\u4e2d' // 字符：中
+'\U00004e2d' // 字符：中
+'\u0027' // 单引号字符
+```
+
+要注意，\u 后面接两个十六进制数。如果是用两个十六进制数无法表示的 Unicode 字符，可以使用\U，\U 后面可以接四个十六进制数来表示一个 Unicode 字 符。 
+
+而且，由于表示码点的 rune 本质上就是一个整型数，所以还可用**整型值来直接作为字 符字面值给 rune 变量赋值**，比如下面代码：
+
+```go
+// 字符字面值 之 整型值作为字符字面值
+'\x27' // 使用十六进制表示的单引号字符
+'\047' // 使用八进制表示的单引号字符
+```
+
+### 字符串字面值 
+
+字符串是字符的集合，了解了字符字面值后，字符串的字面值也就很简单了。
+
+只不过字符串是多个字符，所以需要把表示单个字符的单引号，换为表示多个字符组成的字符串的双引号就可以了。
+
+可以看下面这些例子：
+
+```go
+// 字符串字面值
+"abc\n"
+"中国人"
+"\u4e2d\u56fd\u4eba"                   // 中国人
+"\U00004e2d\U000056fd\U00004eba"       // 中国人
+"中\u56fd\u4eba"                        // 中国人，不同字符字面值形式混合在一起
+"\xe4\xb8\xad\xe5\x9b\xbd\xe4\xba\xba" // 十六进制表示的字符串字面值：中国人
+```
+
+将单个 Unicode 字符字面值一个接一个地连在一起，并用双引号包裹起来就构 成了字符串字面值。
+
+甚至，也可以像倒数第二行那样，将不同字符字面值形式混合在一起，构成一个字符串字面值。 
+
+不过，这里可能发现了一个问题，上面示例代码的最后一行使用的是十六进制形式的字符串字面值，但每个字节的值与前面几行的码点值完全对应不上啊，这是为什么呢？ 
+
+这个字节序列实际上是“中国人”这个 Unicode 字符串的 UTF-8 编码值。
+
+什么是 UTF-8 编码？它又与 Unicode 字符集有什么关系呢？
+
+### UTF-8 编码方案 
+
+UTF-8 编码解决的是 Unicode 码点值在计算机中如何存储和表示（位模式）的问题。
+
+码点唯一确定一个 Unicode 字符，直接用码点值不行么？ 
+
+这的确是可以的，并且 UTF-32 编码标准就是采用的这个方案。UTF-32 编码方案固定使用 4 个字节表示每个 Unicode 字符码点，这带来的好处就是编解码简单，但缺点也很明显， 主要有下面几点：
+
+- 这种编码方案使用 4 个字节存储和传输一个整型数的时候，需要考虑**不同平台的字节序问题** ; （这里指的是多个字节的编码方案，在CPU读取的时候，会有一个先后，顺序需要在加锁的原子操作下保证。）
+- 由于采用 4 字节的固定长度编码，与采用 1 字节编码的 ASCII 字符集**无法兼容**； 
+- 所有 Unicode 字符码点都用 4 字节编码，显然**空间利用率很差**。
+
+针对这些问题，Go 语言之父 Rob Pike 发明了 UTF-8 编码方案。和 UTF-32 方案不同， UTF-8 方案使用**变长度字节**，对 Unicode 字符的码点进行编码。
+
+编码采用的字节数量与 Unicode 字符在码点表中的序号有关：表示序号（码点）小的字符使用的字节数量少，表示序号（码点）大的字符使用的字节数多。
+
+UTF-8 编码使用的字节数量从 1 个到 4 个不等。
+
+- 前 128 个与 ASCII 字符重合的码点 （U+0000~U+007F）使用 1 个字节表示；
+- 带变音符号的拉丁文、希腊文、西里尔字母、 阿拉伯文等使用 2 个字节来表示；
+- 而东亚文字（包括汉字）使用 3 个字节表示；
+- 其他极少使用的语言的字符则使用 4 个字节表示。 
+
+这样的编码方案是兼容 ASCII 字符内存表示的，这意味着采用 UTF-8 方案在内存中表示 Unicode 字符时，已有的 ASCII 字符可以被直接当成 Unicode 字符进行存储和传输，不用再做任何改变。 
+
+此外，UTF-8 的编码单元为一个字节（也就是一次编解码一个字节），所以在处理 UTF-8 方案表示的 Unicode 字符的时候，就不需要像 UTF-32 方案那样考虑字节序问题了。
+
+相对于 UTF-32 方案，UTF-8 方案的空间利用率也是最高的。 
+
+现在，UTF-8 编码方案已经成为 Unicode 字符编码方案的事实标准，各个平台、浏览器等默认均使用 UTF-8 编码方案对 Unicode 字符进行编、解码。
+
+Go 语言也不例外，采用了 UTF-8 编码方案存储 Unicode 字符，在前面按字节输出一个字符串值时看到的字节序列，就是对字符进行 UTF-8 编码后的值。 
+
+那么现在就使用 Go 在标准库中提供的 UTF-8 包，对 Unicode 字符（rune）进行编解码试试看：
+
+```go
+package main
+
+import (
+   "fmt"
+   "unicode/utf8"
+)
+
+// rune -> []byte
+func encodeRune() {
+   var r rune = 0x4E2D
+   fmt.Printf("the unicode charactor is %c\n", r) // 中
+   buf := make([]byte, 3)
+   _ = utf8.EncodeRune(buf, r)                       // 对rune进行utf-8编码
+   fmt.Printf("utf-8 representation is 0x%X\n", buf) // 0xE4B8AD
+}
+
+// []byte -> rune
+func decodeRune() {
+   var buf = []byte{0xE4, 0xB8, 0xAD}
+   r, _ := utf8.DecodeRune(buf)                                                             // 对buf进行utf-8解码
+   fmt.Printf("the unicode charactor after decoding [0xE4, 0xB8, 0xAD] is %s\n", string(r)) // 中
+}
+
+func main() {
+   encodeRune() // 编码
+   decodeRune() // 解码
+}
+```
+
+这段代码中，encodeRune 通过调用 UTF-8 的 EncodeRune 函数实现了对一个 rune，也就是一个 Unicode 字符的编码，decodeRune 则调用 UTF-8 包的 decodeRune，将一段内存字节转换回一个 Unicode 字符。
+
+
+
+### Go 字符串类型的内部表示 
+
+前面提到的 Go 字符串类型的这些优秀的性质，Go 字符串在编译器和运行时 的内部表示是分不开的。
+
+Go 字符串类型的内部表示究竟是什么样的呢？
+
+在标准库的 **reflect 包**中，找到了答案，可以看看下面代码：
+
+```go
+// reflect/value.go
+
+// StringHeader 是一个 string 的运行时表示
+type StringHeader struct {
+   Data uintptr
+   Len  int
+}
+```
+
+string 类型其实是一个“描述符”，它本身并不真正存储字符串数据，而仅是由一个指向底层存储的指针和字符串的长度字段组成的。
+
+画了一张图，直观地展示了一个 string 类型变量在 Go 内存中的存储：
+
+![image-20211224131933831](go_language_type.assets/image-20211224131933831.png)
+
+Go 编译器把源码中的 string 类型映射为运行时的一个**二元组（Data, Len）**，真实的字符串值数据就存储在一个被 Data 指向的底层数组中。
+
+通过 Data 字段，可以得到这个数组的内容，可以看看下面这段代码：
+
+```go
+func dumpBytesArray(arr []byte) {
+   fmt.Printf("[")
+   for _, b := range arr {
+      fmt.Printf("%c ", b)
+   }
+   fmt.Printf("]\n")
+}
+
+func main() {
+   var s = "hello"
+   hdr := (*reflect.StringHeader)(unsafe.Pointer(&s)) // 将string类型变量地址显式
+   fmt.Printf("0x%x\n", hdr.Data)                     // 0x10a30e0
+   p := (*[5]byte)(unsafe.Pointer(hdr.Data))          // 获取Data字段所指向的数组的指针
+   dumpBytesArray((*p)[:])                            // [h e l l o ] // 输出底层数组的内容
+}
+```
+
+这段代码利用了 unsafe.Pointer 的通用指针转型能力，按照 StringHeader 给出的结构内存布局，“顺藤摸瓜”，一步步找到了底层数组的地址，并输出了底层数组内容。
+
+知道了 string 类型的实现原理后，再回头看看 Go 字符串类型性质中“获取长度的时间复杂度是常数时间”那句，是不是就很好理解了？
+
+之所以是常数时间，那是因为**字符串类型中包含了字符串长度信息**，当用 len 函数获取字符串长度时，len 函数只要简单地将这个信息提取出来就可以了。
+
+了解了 string 类型的实现原理后，还可以得到这样一个结论，那就是直接将 string 类型通过函数 / 方法参数传入也不会带来太多的开销。因为**传入的仅仅是一个“描 述符”**，而不是真正的字符串数据。 
+
+### Go 字符串类型的常见操作 
+
+由于字符串的不可变性，针对字符串，更多是尝试对其进行读取，或者将它作为一个组成单元去构建其他字符串，又或是转换为其他类型。
+
+#### 下标操作
+
+第一个操作：下标操作。 
+
+在字符串的实现中，真正存储数据的是底层的数组。字符串的下标操作本质上等价于底层数组的下标操作。
+
+在前面的代码中实际碰到过针对字符串的下标操作，形式是这样的：
+
+```go
+// 字符串常见操作 之 下标操作
+var s = "中国人"
+fmt.Printf("0x%x\n", s[0]) // 0xe4：字符“中” utf-8 编码的第一个字节
+```
+
+通过下标操作，获取的是字符串中特定下标上的字节，而不是字符。 
+
+#### 字符迭代
+
+第二个操作：字符迭代。 
+
+Go 有两种迭代形式：常规 for 迭代与 for range 迭代。要注意，通过这两种形式的迭代对字符串进行操作得到的结果是不同的。
+
+通过常规 for 迭代对字符串进行的操作是一种字节视角的迭代，每轮迭代得到的的结果都是组成字符串内容的一个字节，以及该字节所在的下标值，这也等价于对字符串底层数组的迭代，比如下面代码：
+
+```go
+// 字符串常见操作 之 字符迭代 之 for 迭代
+var t = "中国人"
+for i := 0; i < len(t); i++ {
+   fmt.Printf("index: %d, value: 0x%x\n", i, s[i])
+}
+```
+
+运行这段代码，会看到，经过常规 for 迭代后，获取到的是字符串里字符的 UTF-8 编码中的一个字节：
+
+```sh
+index: 0, value: 0xe4
+index: 1, value: 0xb8
+index: 2, value: 0xad
+index: 3, value: 0xe5
+index: 4, value: 0x9b
+index: 5, value: 0xbd
+index: 6, value: 0xe4
+index: 7, value: 0xba
+index: 8, value: 0xba
+```
+
+而像下面这样使用 for range 迭代，得到的又是什么呢？继续看代码：
+
+```go
+// 字符串常见操作 之 字符迭代 之 for range 迭代
+var u = "中国人"
+for i, v := range u {
+   fmt.Printf("index: %d, value: 0x%x\n", i, v)
+}
+```
+
+同样运行一下这段代码，得到：
+
+```sh
+index: 0, value: 0x4e2d
+index: 3, value: 0x56fd
+index: 6, value: 0x4eba
+```
+
+通过 for range 迭代，每轮迭代得到的是字符串中 Unicode 字符的码点值，以及该字符在字符串中的偏移值。
+
+可以通过这样的迭代，获取字符串中的字符个数，而通过 Go 提供的内置函数 len，只能获取字符串内容的长度（字节个数）。
+
+当然了，获取字符串中字符个数更专业的方法，是调用标准库 UTF-8 包中的 RuneCountInString 函数。
+
+#### 字符串连接
+
+第三个操作：字符串连接。
+
+已经知道，字符串内容是不可变的，但这并不妨碍基于已有字符串创建新字符串。
+
+Go 原生支持通过 +/+= 操作符进行字符串连接，这也是对开发者体验最好的字符串连接操作，可以看看下面这段代码：
+
+```go
+// 字符串常见操作 之 字符串连接
+v := "Rob Pike, "
+v = v + "Robert Griesemer, "
+v += " Ken Thompson"
+fmt.Println(v) // Rob Pike, Robert Griesemer, Ken Thompson
+```
+
+虽然通过 +/+= 进行字符串连接的开发体验是最好的，但连接性能就未必是最快的。
+
+除了这个方法外，Go 还提供了 strings.Builder、strings.Join、fmt.Sprintf 等函数来进行字符串连接操作。
+
+字符串连接分析：
+
+- 示例程序：
+
+  - ```go
+    func plusConcat(n int, str string) string {
+    	// +号拼接
+    }
+    
+    func sprintfConcat(n int, str string) string {
+    	// fmt.Sprintf拼接
+    }
+    
+    func builderConcat(n int, str string) string {
+    	var builder strings.Builder
+    	for i := 0; i < n; i++ {
+    		builder.WriteString(str)
+    	}
+    	return builder.String()
+    }
+    
+    func bufferConcat(n int, s string) string {
+    	buf := new(bytes.Buffer)
+    	for i := 0; i < n; i++ {
+    		buf.WriteString(s)
+    	}
+    	return buf.String()
+    }
+    
+    func byteConcat(n int, str string) string {
+    	buf := make([]byte, 0)
+    	for i := 0; i < n; i++ {
+    		buf = append(buf, str...)
+    	}
+    	return string(buf)
+    }
+    
+    func preByteConcat(n int, str string) string {
+    	buf := make([]byte, 0, n*len(str))
+    	for i := 0; i < n; i++ {
+    		buf = append(buf, str...)
+    	}
+    	return string(buf)
+    }
+    
+    func builderGrowConcat(n int, str string) string {
+    	var builder strings.Builder
+    	builder.Grow(n * len(str))
+    	// 与builderConcat相同
+    
+    }
+    
+    func bufferGrowConcat(n int, s string) string {
+    	buf := new(bytes.Buffer)
+    	buf.Grow(n * len(s))
+    	// 与bufferConcat相同
+    }
+    ```
+
+- benchmem测试：
+
+  - ```sh
+      24 47124538 ns/op 530996721 B/op 10011 allocs/op
+      13 81526461 ns/op 834307836 B/op 37463 allocs/op
+     13263 90613 ns/op 505841 B/op 24 allocs/op
+     12730 94213 ns/op 423537 B/op 13 allocs/op
+     12992 94185 ns/op 612338 B/op 25 allocs/op
+     23606 50058 ns/op 212992 B/op 2 allocs/op
+     24326 49660 ns/op 106496 B/op 1 allocs/op
+     16762 71860 ns/op 212993 B/op 2 allocs/op
+    ```
+
+- 分析：
+
+  - 如果能知道拼接字符串的个数，那么使用bytes.Buffer和strings.Builder的Grows 申请空间后，性能是最好的；
+  - 如果不能确定长度，那么bytes.Buffer和strings.Builder也比“+”和fmt.Sprintf性能好很多。
+
+- bytes.Buffer与strings.Builder对比，strings.Builder更合适
+
+  - 因为bytes.Buffer 转化为字符串时重新申请了一块空间，存放生成的字符串变量；
+  - 而 strings.Builder 直接将底层的 []byte 转换成了字符串类型返回了回来。
+  - bytes.Buffer 的注释中还特意提到了：
+    - To build strings more efficiently, see the strings.Builder type.
+
+- strings.Builder的效率要比+/+=的效率高
+
+  - 因为 string.Builder 是先将第一个字符串的地址取出来，然后将builder的字符串拼接到后面，
+
+    - ```go
+      func (b *Builder) copyCheck() {
+        if b.addr == nil {
+          // This hack works around a failing of Go's escape analysis
+          // that was causing b to escape and be heap allocated.
+          // See issue 23382.
+          // TODO: once issue 7921 is fixed, this should be reverted to
+          // just "b.addr = b".
+          b.addr = (*Builder)(noescape(unsafe.Pointer(b)))
+        } else if b.addr != b {
+          panic("strings: illegal use of non-zero Builder copied by value")
+        }
+      }
+      
+      // String returns the accumulated string.
+      func (b *Builder) String() string {
+        return *(*string)(unsafe.Pointer(&b.buf))
+      }
+      ```
+
+  - +/+=是将两个字符串连接后分配一个新的空间，当连接字符串的数量少时，两者没有什么区别，但是当连接字符串多时，Builder的效率要比+/+=的效率高很多。
+
+#### 字符串比较
+
+第四个操作：字符串比较。 
+
+Go 字符串类型支持各种比较关系操作符，包括 = =、!= 、>=、<=、> 和 <。
+
+在字符串的比较上，Go 采用**字典序的比较策略**，分别从每个字符串的起始处，开始逐个字节地对两个字符串类型变量进行比较。 
+
+当两个字符串之间出现了第一个不相同的元素，比较就结束了，这两个元素的比较结果就会做为串最终的比较结果。
+
+如果出现两个字符串长度不同的情况，长度比较小的字符串会用空元素补齐，空元素比其他非空元素都小。
+
+给了一个 Go 字符串比较的示例：
+
+```go
+// 字符串常见操作 之 字符串比较
+// ==
+s1 := "世界和平"
+s2 := "世界" + "和平"
+fmt.Println(s1 == s2) // true
+// !=
+s1 = "Go"
+s2 = "C"
+fmt.Println(s1 != s2) // true
+// < and <=
+s1 = "12345"
+s2 = "23456"
+fmt.Println(s1 < s2)  // true
+fmt.Println(s1 <= s2) // true
+// > and >=
+s1 = "12345"
+s2 = "123"
+fmt.Println(s1 > s2)  // true
+fmt.Println(s1 >= s2) // true
+```
+
+可以看到，鉴于 Go string 类型是不可变的，所以说如果两个字符串的长度不相同，那么不需要比较具体字符串数据，也可以断定两个字符串是不同的。
+
+但是如果两个字符串长度相同，就要进一步判断，数据指针是否指向同一块底层存储数据。
+
+如果还相同，那么可以说两个字符串是等价的，如果不同，那就还需要进一步去比对实际的数据内容。 
+
+#### 字符串转换
+
+第五个操作：字符串转换。 
+
+在这方面，Go 支持字符串与字节切片、字符串与 rune 切片的双向转换，并且这种转换无需调用任何函数，只需使用显式类型转换就可以了。
+
+看看下面代码：
+
+```go
+// 字符串常见操作 之 字符串转换
+var w string = "中国人"
+// string -> []rune
+rs := []rune(w)
+fmt.Printf("%x\n", rs) // [4e2d 56fd 4eba]
+// string -> []byte
+bs := []byte(w)
+fmt.Printf("%x\n", bs) // e4b8ade59bbde4baba
+// []rune -> string
+w1 := string(rs)
+fmt.Println(w1) // 中国人
+// []byte -> string
+w2 := string(bs)
+fmt.Println(w2) // 中国人
+```
+
+这样的转型看似简单，但无论是 string 转切片，还是切片转 string，这类转型背后也是有着一定**开销**的。这些开销的根源就在于 string 是不可变的，运行时要为转换后的类型**分配新内存**。
+
+## 小结 
+
+Go 原生支持字符串类型，所有字符串变量、常量、字面值都统一设置为 string 类型，对 string 的原生支持使得 Go 字符串有了很多优秀性质。
+
+可以使用两个视角来看待 Go 字符串的组成，
+
+- 一种是字节视角。
+  - Go 字符串是由一个可空的字节序列组成，字节的个数称为字符串的长度；
+- 另外一种是字符视角。
+  - Go 字符串是由一个可空的字符序列构成。
+  - Go 字符串中的每个字符都是一个 Unicode 字符。 
+  - Go 使用 rune 类型来表示一个 Unicode 字符的码点。
+  - 为了传输和存储 Unicode 字符， Go 还使用了 UTF-8 编码方案，UTF-8 编码方案使用变长字节的编码方式，码点小的字符用较少的字节编码，码点大的字符用较多字节编码，这种编码方式兼容 ASCII 字符集，并 且拥有很高的空间利用率。 
+  - Go 语言在运行时层面通过一个二元组结构（Data, Len）来表示一个 string 类型变量，其中 Data 是一个指向存储字符串数据内容区域的指针值，Len 是字符串的长度。
+  - 因此，本质上，一个 string 变量仅仅是一个“描述符”，并不真正包含字符串数据。
+  - 因此，即便直接将 string 类型变量作为函数参数，其传递的开销也是恒定的，不会随着字符串大小的变化而变化。
+
+Go 为其原生支持的 string 类型提供了许多原生操作类型，在进行字符串操作时要注意以下几点：
+
+- 通过常规 for 迭代与 for range 迭代所得到的结果不同，常规 for 迭代采用的是字节视角；而 for range 迭代采用的是字符视角； 
+- 基于 +/+= 操作符的字符串连接是对开发者体验最好的字符串连接方式，但却不是性能最好的方式； 
+- 无论是字符串转切片，还是切片转字符串，都会有内存分配的开销，这缘于 Go 字符串数据内容不可变的性质。
+
 
 
 
