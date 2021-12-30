@@ -462,79 +462,443 @@ Go 方法本质上其实是一个函数，这个函数以方法的 receiver 参�
 
   
 
+### Go 方法设计
 
+在 Go 语言中，方法本质上就是函数，所以之前讲解的、关于函数设计的内容对方法也同样适用，比如错误处理设计、针对异常的处理策略、使用 defer 提升简洁性，等等。 
 
+但关于 Go 方法中独有的 receiver 组成部分，却没有现成的、可供我参考的内容。初学者在学习 Go 方法时，最头疼的一个问题恰恰就是如何选择 receiver 参数的 类型。
 
+### receiver 参数类型
 
+#### receiver 参数类型对 Go 方法的影响 
 
+要想为 receiver 参数选出合理的类型，先要了解不同的 receiver 参数类型会对 Go 方法产生怎样的影响。
 
+**Go 方法的本质，是以方法的 receiver 参数作为第一个参数的普通函数**。 
 
+对于函数参数类型对函数的影响，是很熟悉的。那么能不能将方法等价转换为对应的函数，再通过分析 receiver 参数类型对函数的影响，从而**间接**得出它对 Go 方法的影响呢？ 
 
+可以基于这个思路试试看。直接来看下面例子中的两个 Go 方法，以及它们等价转换后的函数：
 
+```go
+func (t T) M1() <=> F1(t T)
+func (t *T) M2() <=> F2(t *T)
+```
 
+这个例子中有方法 M1 和 M2。M1 方法是 receiver 参数类型为 T 的一类方法的代表，而 M2 方法则代表了 receiver 参数类型为 *T 的另一类。下面分别来看看不同的 receiver 参数类型对 M1 和 M2 的影响。
 
+- 首先，当 receiver 参数的类型为 T 时：
+  - 当选择以 T 作为 receiver 参数类型时，M1 方法等价转换为F1(t T)。
+  - Go 函数的参数采用的是**值拷贝传递**，也就是说，F1 函数体中的 t 是 T 类型实例的一个**副本**。这样，在 F1 函数的实现中对参数 t 做任何修改，都只会影响副本，而不会影响到原 T 类型实例。
 
+据此可以得出结论：当方法 M1 采用类型为 T 的 receiver 参数时，代表 T 类型实例的 receiver 参数以值传递方式传递到 M1 方法体中的，实际上是 T 类型实例的副本，M1 方法体中对副本的任何修改操作，都不会影响到原 T 类型实例。
 
+- 第二，当 receiver 参数的类型为 *T 时：
+  - 当选择以 *T 作为 receiver 参数类型时，M2 方法等价转换为F2(t *T)。
+  - 同上面分析，传递给 F2 函数的 t 是 T 类型实例的**地址**，这样 F2 函数体中对参数 t 做的任何修改，都会反映到原 T 类型实例上。
 
+据此也可以得出结论：当方法 M2 采用类型为 *T 的 receiver 参数时，代表 *T 类型实例的 receiver 参数以值传递方式传递到 M2 方法体中的，实际上是 T 类型实例的地址，M2 方法体通过该地址可以对原 T 类型实例进行任何修改操作。 
 
+#### receiver 类型对原类型实例的影响
 
+再通过一个更直观的例子，证明一下上面这个分析结果，看一下 Go 方法选择不同的 receiver 类型**对原类型实例的影响**：
 
+```go
+package main
 
+type T struct {
+   a int
+}
 
+func (t T) M1() {
+   t.a = 10
+}
 
+func (t *T) M2() {
+   t.a = 11
+}
 
+func main() {
+   var t T
+   println(t.a) // 0
 
+   t.M1()
+   println(t.a) // 0
+   
+   p := &t
+   p.M2()
+   println(t.a) // 11
+}
+```
 
+在这个示例中，为基类型 T 定义了两个方法 M1 和 M2，其中 M1 的 receiver 参数类型为 T，而 M2 的 receiver 参数类型为 *T。M1 和 M2 方法体都通过 receiver 参数 t 对 t 的字段 a 进行了修改。
 
+但运行这个示例程序后，
 
+- 方法 M1 由于使用了 T 作为 receiver 参数类型，它在 方法体中修改的仅仅是 T 类型实例 t 的副本，原实例并没有受到影响。因此 M1 调用后， 输出 t.a 的值仍为 0。 
+- 而方法 M2 呢，由于使用了 *T 作为 receiver 参数类型，它在方法体中通过 t 修改的是实例本身，因此 M2 调用后，t.a 的值变为了 11，这些输出结果与前面的分析是一致 的。 
 
+了解了不同类型的 receiver 参数对 Go 方法的影响后，就可以总结一下，日常编码中 选择 receiver 的参数类型的时候，可以参考哪些原则。 
 
+#### 选择 receiver 参数类型的第一个原则 
 
+基于上面的影响分析，可以得到选择 receiver 参数类型的第一个原则：**如果 Go 方法要把对 receiver 参数代表的类型实例的修改，反映到原类型实例上，那么应该选择 *T 作为 receiver 参数的类型**。 
 
+这个原则似乎很好掌握，不过这个时候，可能会有个疑问：如果选择了 *T 作为 Go 方法 receiver 参数的类型，那么是不是只能通过 *T 类型变量调用该方法，而不能通过 T 类型变量调用了呢？
 
+这个问题恰恰也是遗留的一个问题。改造一下上面例子看一下：
 
+```go
+package main
 
+type T struct {
+   a int
+}
 
+func (t T) M1() {
+   t.a = 10
+}
 
+func (t *T) M2() {
+   t.a = 11
+}
 
+func main() {
+   var t1 T
+   println(t1.a) // 0
+   t1.M1()
+   println(t1.a) // 0
+   t1.M2()
+   println(t1.a) // 11
 
+   var t2 = &T{}
+   println(t2.a) // 0
+   t2.M1()
+   println(t2.a) // 0
+   t2.M2()
+   println(t2.a) // 11
+}
+```
 
+先来看看类型为 T 的实例 t1。
 
+- 看到它不仅可以调用 receiver 参数类型为 T 的方 法 M1，它还可以直接调用 receiver 参数类型为 *T 的方法 M2，并且调用完 M2 方法 后，t1.a 的值被修改为 11 了。 
+- 其实，T 类型的实例 t1 之所以可以调用 receiver 参数类型为 *T 的方法 M2，都是 Go 编译器在背后自动进行转换的结果。
+- 或者说，t1.M2() 这种用法是 Go 提供的“语法糖”： Go 判断 t1 的类型为 T，也就是与方法 M2 的 receiver 参数类型 *T 不一致后，会自动将 t1.M2()转换为(&t1).M2()。 
 
+同理，类型为 *T 的实例 t2，
 
+- 它不仅可以调用 receiver 参数类型为 *T 的方法 M2，还可以调用 receiver 参数类型为 T 的方法 M1，这同样是因为 Go 编译器在背后做了转换。
+- 也就是，Go 判断 t2 的类型为 \*T，与方法 M1 的 receiver 参数类型 T 不一致，就会自动将 t2.M1()转换为(*t2).M1()。 
 
+通过这个实例，知道了这样一个结论：无论是 T 类型实例，还是 *T 类型实例，都既可以调用 receiver 为 T 类型的方法，也可以调用 receiver 为 *T 类型的方法。
 
+这样，在为方法选择 receiver 参数的类型的时候，就不需要担心这个方法不能被与 receiver 参数类型不一致的类型实例调用了。
 
+#### 选择 receiver 参数类型的第二个原则 
 
+前面第一个原则说的是，在方法中对 receiver 参数代表的类型实例进行修改，那就要为 receiver 参数选择 *T 类型，但是如果不需要在方法中对类型实例进行修改呢？
 
+这个时候是为 receiver 参数选择 T 类型还是 *T 类型呢？ 这也得分情况。
 
+一般情况下，通常会**为 receiver 参数选择 T 类型**，因为这样可以缩窄外部修改类型实例内部状态的“接触面”，也就是**尽量少暴露可以修改类型内部状态的方法**。 
 
+不过也有一个例外需要特别注意。
 
+- 考虑到 Go 方法调用时，receiver 参数是以值拷贝的形式传入方法中的。
+- 那么，如果 receiver 参数类型的 size 较大，以值拷贝形式传入就会导致**较大的性能开销**，这时选择 *T 作为 receiver 类型可能更好些。 
 
+以上这些可以作为选择 receiver 参数类型的第二个原则。 
 
+#### 方法集合（Method Set）
 
+先了解一个基本概念：方法集合（Method Set）， 它是理解第三条原则的前提。 
 
+##### 方法集合解决的问题
 
+在了解方法集合是什么之前，先通过一个示例，直观了解一下为什么要有方法集合， 它主要用来解决什么问题：
 
+```go
+package main
 
+type Interface interface {
+   M1()
+   M2()
+}
 
+type T struct{}
 
+func (t T) M1()  {}
+func (t *T) M2() {}
 
+func main() {
+   var t T
+   var pt *T
+   var i Interface
+   i = pt
+   i = t // cannot use t (type T) as type Interface in assignment: T does not implement Interface (M2 method has pointer receiver)
+}
+```
 
+在这个例子中，
 
+- 定义了一个接口类型 Interface 以及一个自定义类型 T。
+- Interface 接口类型包含了两个方法 M1 和 M2，它们的基类型都是 T，但它们的 receiver 参数类型不同，一个为 T，另一个为 *T。
+- 在 main 函数中，分别将 T 类型实例 t 和 *T 类型实例 pt 赋值给 Interface 类型变量 i。 
 
+运行一下这个示例程序，在i = t这一行会得到 Go 编译器的错误提示，**Go 编译器提示：T 没有实现 Interface 类型方法列表中的 M2，因此类型 T 的实例 t 不能赋值给 Interface 变量**。 
 
+为什么 *T 类型的 pt 可以被正常赋值给 Interface 类型变量 i，而 T 类型 的 t 就不行呢？如果说 T 类型是因为只实现了 M1 方法，未实现 M2 方法而不满足 Interface 类型的要求，那么 *T 类型也只是实现了 M2 方法，并没有实现 M1 方法啊？ 
 
+有些事情并不是表面看起来这个样子的。了解方法集合后，这个问题就迎刃而解了。同时，**方法集合也是用来判断一个类型是否实现了某接口类型的唯一手段**，可以说，“方法集合决定了接口实现”。
 
+那么，什么是类型的方法集合呢？ 
 
+- Go 中任何一个类型都有属于自己的方法集合，或者说方法集合是 Go 类型的一个“属性”。但不是所有类型都有自己的方法呀，比如 int 类型就没有。
+- 所以，对于没有定义方法的 Go 类型，称其拥有**空方法集合**。 
+- 接口类型相对特殊，它只会列出代表接口的方法列表，不会具体定义某个方法，它的方法集合就是它的方法列表中的所有方法，可以一目了然地看到。
+- 因此，下面重点讲解的是非接口类型的方法集合。 
 
+##### dumpMethodSet
 
+为了方便查看一个**非接口类型的方法集合**，这里提供了一个函数 dumpMethodSet，用于输出一个非接口类型的方法集合：
 
+```go
+func dumpMethodSet(i interface{}) {
+   dynTyp := reflect.TypeOf(i)
+   if dynTyp == nil {
+      fmt.Printf("there is no dynamic type\n")
+      return
+   }
+   n := dynTyp.NumMethod()
+   if n == 0 {
+      fmt.Printf("%s's method set is empty!\n", dynTyp)
+      return
+   }
+   fmt.Printf("%s's method set:\n", dynTyp)
+   for j := 0; j < n; j++ {
+      fmt.Println("-", dynTyp.Method(j).Name)
+   }
+   fmt.Printf("\n")
+}
+```
 
+下面利用这个函数，试着输出一下 **Go 原生类型以及自定义类型的方法集合**，看下面 代码：
 
+```go
+type T struct{}
 
+func (T) M1()  {}
+func (T) M2()  {}
 
+func (*T) M3() {}
+func (*T) M4() {}
 
+func main() {
+   var n int
+   dumpMethodSet(n)
+   dumpMethodSet(&n)
+   
+   var t T
+   dumpMethodSet(t)
+   dumpMethodSet(&t)
+}
+```
+
+运行这段代码，得到如下结果：
+
+```sh
+int's method set is empty!
+*int's method set is empty!
+main.T's method set:
+- M1
+- M2
+
+*main.T's method set:
+- M1
+- M2
+- M3
+- M4
+```
+
+可以看到：
+
+- 以 int、*int 为代表的 Go 原生类型由于没有定义方法，所以它们的方法集合都是空的。
+- 自定义类型 T 定义了方法 M1 和 M2，因此它的方法集合包含了 M1 和 M2，也符合预期。
+- 但 \*T 的方法集合中除了预期的 M3 和 M4 之外，居然还包含了类型 T 的方 法 M1 和 M2！ 不过，这里程序的输出并没有错误。 
+
+这是因为，Go 语言规定，***T 类型的方法集合包含所有以 *T 为 receiver 参数类型的方法，以及所有以 T 为 receiver 参数类型的方法**。这就是这个示例中为何 *T 类型的方法集合包含四个方法的原因。 
+
+##### 验证方法集合
+
+这个时候，是不是也找到了前面那个示例中为何i = pt没有报编译错误的原因了呢？
+
+同样可以使用 dumpMethodSet 工具函数，输出一下那个例子中 pt 与 t 各自所属类型 的方法集合：
+
+```go
+package main
+
+import (
+   "fmt"
+   "reflect"
+)
+
+// 输出方法集合，确定问题
+
+type Interface interface {
+   M1()
+   M2()
+}
+
+type T struct{}
+
+func (t T) M1()  {}
+func (t *T) M2() {}
+
+func dumpMethodSet(i interface{}) {
+   dynTyp := reflect.TypeOf(i)
+   if dynTyp == nil {
+      fmt.Printf("there is no dynamic type\n")
+      return
+   }
+   n := dynTyp.NumMethod()
+   if n == 0 {
+      fmt.Printf("%s's method set is empty!\n", dynTyp)
+      return
+   }
+   fmt.Printf("%s's method set:\n", dynTyp)
+   for j := 0; j < n; j++ {
+      fmt.Println("-", dynTyp.Method(j).Name)
+   }
+   fmt.Printf("\n")
+}
+
+func main() {
+   var t T
+   var pt *T
+   dumpMethodSet(t)
+   dumpMethodSet(pt)
+}
+```
+
+运行上述代码，得到如下结果：
+
+```sh
+main.T's method set:
+- M1
+
+*main.T's method set:
+- M1
+- M2
+```
+
+通过这个输出结果，可以一目了然地看到 T、*T 各自的方法集合。 
+
+- T 类型的方法集合中只包含 M1，没有 Interface 类型方法集合中的 M2 方法， 这就是 Go 编译器认为变量 t 不能赋值给 Interface 类型变量的原因。 
+- 在输出的结果中，还看到 \*T 类型的方法集合除了包含它自身定义的 M2 方法外，还包含了 T 类型定义的 M1 方法，*T 的方法集合与 Interface 接口类型的方法集合是一样的， 因此 pt 可以被赋值给 Interface 接口类型的变量 i。 
+
+到这里，已经知道了所谓的**方法集合决定接口实现**的含义就是：
+
+- 如果某类型 T 的方法集合与某接口类型的方法集合相同，或者类型 T 的方法集合是接口类型 I 方法集合的超集，那么就说这个类型 T 实现了接口 I。
+- 或者说，方法集合这个概念在 Go 语言中的主要用途，就是用来判断某个类型是否实现了某个接口。 
+
+有了方法集合的概念做铺垫，选择 receiver 参数类型的第三个原则已经呼之欲出了。
+
+#### 选择 receiver 参数类型的第三个原则 
+
+这个原则的选择依据就是 **T 类型是否需要实现某个接口**。 
+
+- 如果 T 类型需要实现某个接口，那就要使用 T 作为 receiver 参数的类型，来满足接口类型方法集合中的所有方法。
+- 如果 T 不需要实现某一接口，但 \*T 需要实现该接口，那么根据方法集合概念，*T 的方法集合是包含 T 的方法集合的，这样在确定 Go 方法的 receiver 的类型时，参考原则一 和原则二就可以了。 
+
+如果说前面的两个原则更多聚焦于类型内部，从单个方法的实现层面考虑，那么这第三个原则是更多从全局的设计层面考虑，聚焦于这个类型与接口类型间的耦合关系。
+
+
+
+### 小结 
+
+Go 方法本质上也是函数。所以 Go 方法设计的多数地方，都可以借鉴函数设计的相关内容。唯独 Go 方法的 receiver 部分，是没有现成经验可循的。
+
+如何为 Go 方法的 receiver 参数选择类型。 
+
+- 先了解了不同类型的 receiver 参数对 Go 方法行为的影响，这是进行 receiver 参 数选型的前提。 
+- 在这个前提下，提出了 receiver 参数选型的三个经验原则，实际进行 Go 方法设计时，首先应该考虑的是原则三，即 T 类型是否要实现某一接口。 
+  - 如果 T 类型需要实现某一接口的全部方法，那么就需要使用 T 作为 receiver 参数的类型来满足接口类型方法集合中的所有方法。 
+  - 如果 T 类型不需要实现某一接口，那么就可以参考原则一和原则二来为 receiver 参数选择类型了。
+  - 也就是，如果 Go 方法要把对 receiver 参数所代表的类型实例的修改反映到 原类型实例上，那么应该选择 *T 作为 receiver 参数的类型。
+  - 否则通常会为 receiver 参数选择 T 类型，这样可以减少外部修改类型实例内部状态的“渠道”。
+  - 除非 receiver 参数类型的 size 较大，考虑到传值的较大性能开销，选择 *T 作为 receiver 类型可能更适合。 
+- Go 语言中的一个重要概念：方法集合。
+  - 它在 Go 语言中的主要用途就是判断某个类型是否实现了某个接口。
+  - 方法集合像“胶水”一样，将自定义类型与接口隐式地“粘结”在一起，后面理解带有类型嵌入的类型时还会借助这个概 念。 
+
+### 思考题 
+
+方法集合是一个很重要也很实用的概念， 如果一个类型 T 包含两个方法 M1 和 M2：
+
+```go
+type T struct{}
+
+func (T) M1() {}
+func (T) M2() {}
+```
+
+然后，再使用类型定义语法，又基于类型 T 定义了一个新类型 S：
+
+```go
+type S T
+```
+
+那么，这个 S 类型包含哪些方法呢？*S 类型又包含哪些方法呢？
+
+- 验证：
+
+  - ```go
+    type T struct{}
+    
+    func (T) M1() {}
+    func (T) M2() {}
+    
+    type S T
+    // type S =  T
+    
+    func main() {
+       var t T
+       dumpMethodSet(t)
+       dumpMethodSet(&t)
+       
+       var s S
+       dumpMethodSet(s)
+       dumpMethodSet(&s)
+    }
+    ```
+
+- 输出：
+
+  - ```sh
+    main.T's method set:
+    - M1
+    - M2
+    
+    *main.T's method set:
+    - M1
+    - M2
+    
+    main.S's method set is empty!
+    *main.S's method set is empty!
+    ```
+
+- S 类型 和 *S 类型都没有包含方法
+
+- 因为S是新的类型，它不能调用T的方法，必须显示转换之后 才可以调用，所以本身的S或*S类型都不具有任何的方法
+
+- 但是如果用 type S = T 则S和*S类型都包含两个方法。
+
+
+
+
+
+### Go 类型嵌入
 
 
 
