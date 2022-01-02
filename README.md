@@ -23,6 +23,8 @@ Learn Go program with a beginner's mind.
 - 《The Way To Go》- Go 语言百科全书
   - [豆瓣 The Way To Go](https://book.douban.com/subject/10558892/)
   - [Go 入门指南](https://github.com/Unknwon/the-way-to-go_ZH_CN)
+- 《Go语言编程》
+  - [豆瓣 Go语言编程](https://book.douban.com/subject/11577300/)
 
 
 
