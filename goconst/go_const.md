@@ -288,6 +288,8 @@ const (
    SOMAXCONN    // 2
    SO_ERROR     // 3
 )
+
+// 备注：在 src/cmd/compile/internal/syntax/tokens.go 文件中定义了 Go 语言中支持的全部 Token 类型，所有的 token 类型都是正整数，也是用了这种方式实现
 ```
 
 在这个代码里，使用了空白标识符作为第一个枚举常量，它的值就是 iota。虽然它本身没有实际意义，但后面的常量值都会重复它的初值表达式（这里是 iota），于是真正的枚举常量值就从 1 开始了。 
