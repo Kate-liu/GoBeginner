@@ -302,6 +302,30 @@ dumped SSA to ./ssa.html
 
 
 
+### Go 代码转换为汇编代码
+
+使用下面的命令，可以在当前文件生成汇编代码。
+
+其中main.s文件中是原go程序的汇编，可以根据(main.go:24)的行号，来对照原文件查找转换后的汇编代码。
+
+```sh
+$go tool compile -S main.go > main.s
+ 
+$ls -al
+total 120
+drwxr-xr-x   5 rmliu  staff    160 Jan  4 19:51 .
+drwxr-xr-x  15 rmliu  staff    480 Jan  4 19:51 ..
+-rw-r--r--   1 rmliu  staff    308 Jan  4 19:50 main.go
+-rw-r--r--   1 rmliu  staff  17826 Jan  4 19:51 main.o
+-rw-r--r--   1 rmliu  staff  36214 Jan  4 19:51 main.s
+```
+
+
+
+
+
+
+
 ## mac 命令行工具
 
 ### 获得当前机器的硬件信息
