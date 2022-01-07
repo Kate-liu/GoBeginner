@@ -472,6 +472,28 @@ fmt.Println(nums)      // [1 2 3 4 5 6 7]
 fmt.Println(len(nums)) // 7
 ```
 
+`cmd/compile/internal/types.NewSlice`就是在编译 期间 用于创建切片类型的函数：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/types/type.go
+// NewSlice returns the slice Type with element type elem.
+func NewSlice(elem *Type) *Type {
+	if t := elem.Cache.slice; t != nil {
+		if t.Elem() != elem {
+			Fatalf("elem mismatch")
+		}
+		return t
+	}
+
+	t := New(TSLICE)
+	t.Extra = Slice{Elem: elem}
+	elem.Cache.slice = t
+	return t
+}
+```
+
+上述方法返回结构体中的 `Extra` 字段是一个**只包含切片内元素类型的结构**，也就是说切片内元素的类型都是在编译期间确定的，编译器确定了类型之后，会将类型存储在 `Extra` 字段中帮助程序在运行时动态获取。
+
 
 
 ### Go 是如何实现切片类型的？ 
@@ -501,9 +523,48 @@ type slice struct {
 
 > 图中的底层数组长度是12与切片长度不同的原因是，append 了一个新的元素，此时就会默认执行切片的扩充，变为原来的二倍，即6的二倍为12。
 
+编译期间的切片是 `cmd/compile/internal/types.Slice` 类型的，但是在运行时切片可以由如下的 `reflect.SliceHeader` 结构体表示，其中:
+
+- `Data` 是指向数组的指针;
+- `Len` 是当前切片的长度；
+- `Cap` 是当前切片的容量，即 `Data` 数组的大小：
+
+```go
+// github.com/golang/go/src/reflect/value.go
+// SliceHeader is the runtime representation of a slice.
+// It cannot be used safely or portably and its representation may
+// change in a later release.
+// Moreover, the Data field is not sufficient to guarantee the data
+// it references will not be garbage collected, so programs must keep
+// a separate, correctly typed pointer to the underlying data.
+type SliceHeader struct {
+	Data uintptr
+	Len  int
+	Cap  int
+}
+```
+
+`Data` 是一片连续的内存空间，这片内存空间可以用于存储切片中的全部元素。
+
+数组中的元素只是逻辑上的概念，底层存储其实都是连续的，可以将切片理解成一片连续的内存空间加上长度与容量的标识。
+
+
+
 ### 创建切片
 
 还可以用以下几种方法创建切片，并指定它底层数组的长度。 
+
+Go 语言中包含三种初始化切片的方式：
+
+1. 通过下标的方式获得数组或者切片的一部分；
+2. 使用字面量初始化新的切片；
+3. 使用关键字 `make` 创建切片：
+
+```go
+arr[0:3] or slice[0:3]
+slice := []int{1, 2, 3}
+slice := make([]int, 10)
+```
 
 #### make 函数创建切片
 
@@ -532,6 +593,138 @@ fmt.Println(cap(sl2))  // 6
 到这里，肯定会有一个问题，为什么上面图中 nums 切片的底层数组长度为 12，而不是初始的 len 值 6 呢？
 
 > 图中的底层数组长度是12与切片长度不同的原因是，append 了一个新的元素，此时就会默认执行切片的扩充，变为原来的二倍，即6的二倍为12。
+
+当使用 `make` 关键字创建切片时，很多工作都需要运行时的参与；调用方必须向 `make` 函数传入切片的大小以及可选的容量，类型检查期间的 `cmd/compile/internal/gc.typecheck1` 函数会校验入参：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/typecheck.go
+func typecheck1(n *Node, top int) (res *Node) {
+	switch n.Op {
+	...
+	case OMAKE:
+		args := n.List.Slice()
+
+		i := 1
+		switch t.Etype {
+		case TSLICE:
+			if i >= len(args) {
+				yyerror("missing len argument to make(%v)", t)
+				return n
+			}
+
+			l = args[i]
+			i++
+			var r *Node
+			if i < len(args) {
+				r = args[i]
+			}
+			...
+			if Isconst(l, CTINT) && r != nil && Isconst(r, CTINT) && l.Val().U.(*Mpint).Cmp(r.Val().U.(*Mpint)) > 0 {
+				yyerror("len larger than cap in make(%v)", t)
+				return n
+			}
+
+			n.Left = l
+			n.Right = r
+			n.Op = OMAKESLICE
+		}
+	...
+	}
+}
+```
+
+上述函数不仅会检查 `len` 是否传入，还会保证传入的容量 `cap` 一定大于或者等于 `len`。
+
+除了校验参数之外，当前函数会将 `OMAKE` 节点转换成 `OMAKESLICE`，中间代码生成的 `cmd/compile/internal/gc.walkexpr` 函数会依据下面两个条件转换 `OMAKESLICE` 类型的节点：
+
+1. 切片的大小和容量是否足够小；
+2. 切片是否发生了逃逸，确定是否在堆上初始化。
+
+当切片发生逃逸或者非常大时，运行时需要 `runtime.makeslice` 在**堆上初始化切片**。
+
+如果当前的切片不会发生逃逸并且切片非常小的时候，`make([]int, 3, 4)` 会**被直接转换**成如下所示的代码：
+
+```go
+var arr [4]int
+n := arr[:3]
+```
+
+上述代码会初始化数组并通过下标 `[:3]` 得到数组对应的切片，这两部分操作都会在编译阶段完成，编译器会在栈上或者静态存储区创建数组并将 `[:3]` 转换成 `OpSliceMake` 操作。
+
+分析了主要由编译器处理的分支之后，回到用于创建切片的**运行时**函数 `runtime.makeslice`，这个函数的实现很简单：
+
+```go
+// github.com/golang/go/src/runtime/slice.go
+func makeslice(et *_type, len, cap int) unsafe.Pointer {
+	mem, overflow := math.MulUintptr(et.size, uintptr(cap))
+	if overflow || mem > maxAlloc || len < 0 || len > cap {
+		mem, overflow := math.MulUintptr(et.size, uintptr(len))
+		if overflow || mem > maxAlloc || len < 0 {
+			panicmakeslicelen()
+		}
+		panicmakeslicecap()
+	}
+
+  // Allocate an object of size bytes.
+  // Small objects are allocated from the per-P cache's free lists.
+  // Large objects (> 32 kB) are allocated straight from the heap.
+	return mallocgc(mem, et, true)
+}
+```
+
+上述函数的主要工作是计算切片占用的内存空间并在堆上申请一片连续的内存，它使用如下的方式计算占用的内存：
+
+`内存空间=切片中元素大小×切片容量内存空间=切片中元素大小×切片容量`
+
+虽然编译期间可以检查出很多错误，但是在创建切片的过程中如果发生了以下错误会直接**触发运行时错误并崩溃**：
+
+1. 内存空间的大小发生了溢出；
+2. 申请的内存大于最大可分配的内存；
+3. 传入的长度小于 0 或者长度大于容量；
+
+`runtime.makeslice` 在最后调用的 `runtime.mallocgc` 是用于申请内存的函数，这个函数的实现还是比较复杂，如果遇到了比较小的对象会直接初始化在 Go 语言调度器里面的 P 结构中，而大于 32KB 的对象会在堆上初始化。
+
+在之前版本的 Go 语言中，数组指针、长度和容量会被合成一个 `runtime.slice` 结构，但是从 [cmd/compile: move slice construction to callers of makeslice](https://github.com/golang/go/commit/020a18c545bf49ffc087ca93cd238195d8dcc411#diff-d9238ca551e72b3a80da9e0da10586a4) 提交之后，构建结构体 `reflect.SliceHeader`的工作就都交给了 `runtime.makeslice` 的调用方，该函数仅会返回指向底层数组的指针，调用方会在编译期间构建切片结构体：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/typecheck.go
+func typecheck1(n *Node, top int) (res *Node) {
+	switch n.Op {
+	...
+	case OSLICEHEADER:
+	switch 
+    // Errors here are Fatalf instead of yyerror because only the compiler
+		// can construct an OSLICEHEADER node.
+		// Components used in OSLICEHEADER that are supplied by parsed source code
+		// have already been typechecked in e.g. OMAKESLICE earlier.
+		t := n.Type
+		n.Left = typecheck(n.Left, ctxExpr)
+		l := typecheck(n.List.First(), ctxExpr)
+		c := typecheck(n.List.Second(), ctxExpr)
+		l = defaultlit(l, types.Types[TINT])
+		c = defaultlit(c, types.Types[TINT])
+
+		n.List.SetFirst(l)
+		n.List.SetSecond(c)
+	...
+	}
+}
+```
+
+`OSLICEHEADER` 操作会创建在上面介绍过的结构体 `reflect.SliceHeader`，其中包含数组指针、切片长度和容量，它是切片在运行时的表示：
+
+```go
+// github.com/golang/go/src/reflect/value.go
+type SliceHeader struct {
+	Data uintptr
+	Len  int
+	Cap  int
+}
+```
+
+正是因为大多数对切片类型的操作并不需要直接操作原来的 `runtime.slice` 结构体，所以 `reflect.SliceHeader` 的引入能够减少切片初始化时的少量开销，该改动不仅能够减少 ~0.2% 的 Go 语言包大小，还能够减少 92 个 `runtime.panicIndex` 的调用，占 Go 语言二进制的 ~3.5%。
+
+
 
 #### 数组的切片化
 
@@ -577,6 +770,64 @@ fmt.Println(sl3[5])  // 测试：在切片在访问 大于长度 小于 cap 的�
 
 此外，在进行数组切片化的时候，**通常省略 max**，而 **max 的默认值为数组的长度**。（备注：这个默认值是数组的长度不太对吧！应该是原来数组被切片之后，从切片的起始位置到最后一个元素的个数。）
 
+使用下标创建切片（也就是基于数组初始化切片）是最原始也最接近汇编语言的方式，它是所有方法中最为底层的一种，编译器会将 `arr[0:3]` 或者 `slice[0:3]` 等语句转换成 `OpSliceMake` 操作，可以通过下面的代码来验证一下：
+
+```go
+package main
+
+func newSlice() []int {
+	arr := [3]int{1, 2, 3}
+	slice := arr[0:1]
+	return slice
+}
+
+$GOSSAFUNC=newSlice go build main.go
+# command-line-arguments
+dumped SSA to ./ssa.html
+```
+
+通过 `GOSSAFUNC` 变量编译上述代码可以得到一系列 SSA 中间代码，其中 `slice := arr[0:1]` 语句在 “decompose builtin” 阶段对应的代码如下所示：
+
+```go
+v27 (+5) = SliceMake <[]int> v11 v14 v17
+
+name &arr[*[3]int]: v11
+name slice.ptr[*int]: v11
+name slice.len[int]: v14
+name slice.cap[int]: v17
+```
+
+![image-20220107215249409](go_language_compound_data_type.assets/image-20220107215249409.png)
+
+`SliceMake` 操作会接受四个参数创建新的切片：元素类型、数组指针、切片大小和容量。
+
+需要注意的是使用下标初始化切片不会拷贝原数组或者原切片中的数据，它只会创建一个指向原数组的切片结构体，所以**修改新切片的数据也会修改原切片**。
+
+
+
+#### 字面量创建切片
+
+当使用字面量 `[]int{1, 2, 3}` 创建新的切片时，`cmd/compile/internal/gc.slicelit` 函数会在编译期间将它展开成如下所示的代码片段：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/sinit.go
+var vstat [3]int
+vstat[0] = 1
+vstat[1] = 2
+vstat[2] = 3
+var vauto *[3]int = new([3]int)
+*vauto = vstat
+slice := vauto[:]
+```
+
+1. 根据切片中的元素数量对底层数组的大小进行推断并创建一个数组；
+2. 将这些字面量元素存储到初始化的数组中；
+3. 创建一个同样指向 `[3]int` 类型的数组指针；
+4. 将静态存储区的数组 `vstat` 赋值给 `vauto` 指针所在的地址；
+5. 通过 `[:]` 操作获取一个底层使用 `vauto` 的切片；
+
+第 5 步中的 `[:]` 就是使用下标创建切片的方法，从这一点也能看出 `[:]` 操作是创建切片最底层的一种方法。
+
 
 
 #### 数组的（多个切）片化
@@ -590,6 +841,8 @@ fmt.Println(sl3[5])  // 测试：在切片在访问 大于长度 小于 cap 的�
 可以看到，上图中的两个切片 sl1 和 sl2 是数组 arr 的“描述符”，这样的情况下，无论通过哪个切片对数组进行的修改操作，都会反映到另一个切片中。
 
 比如，将 sl2[2]置为 14，那么 sl1[0]也会变成 14，因为 sl2[2]直接操作的是底层数组 arr 的第四个元素 arr[3]。 
+
+
 
 #### 切片创建切片
 
@@ -639,6 +892,57 @@ fmt.Println(len(s), cap(s)) // 5 8
 可以看到，append 会根据切片的需要，在当前底层数组容量无法满足的情况下，**动态分配新的数组**，新数组长度会按一定规律扩展。
 
 在上面这段代码中，针对元素是 int 型的数组，新数组的容量是当前数组的 2 倍。新数组建立后，append 会把旧数组中的数据拷贝到新数组中，之后新数组便成为了切片的底层数组，旧数组会被垃圾回收掉。 
+
+使用 `len` 和 `cap` 获取长度或者容量是切片最常见的操作，编译器将它们看成两种特殊操作，即 `OLEN` 和 `OCAP`，`cmd/compile/internal/gc.state.expr` 函数会在 SSA 生成 阶段将它们分别转换成 `OpSliceLen` 和 `OpSliceCap`：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/ssa.go
+// expr converts the expression n to ssa, adds it to s and returns the ssa result.
+func (s *state) expr(n *Node) *ssa.Value {
+	switch n.Op {
+	case OLEN, OCAP:
+		switch {
+		case n.Left.Type.IsSlice():
+			op := ssa.OpSliceLen
+			if n.Op == OCAP {
+				op = ssa.OpSliceCap
+			}
+			return s.newValue1(op, types.Types[TINT], s.expr(n.Left))
+		...
+		}
+	...
+	}
+}
+```
+
+访问切片中的字段可能会触发 “decompose builtin” 阶段的优化，`len(slice)` 或者 `cap(slice)` 在一些情况下会直接**替换成切片的长度或者容量**，不需要在运行时获取：
+
+```go
+// 这一步操作会在 before insert phis 之后中看到，在最后的 genssa 阶段就看不到了
+(SlicePtr (SliceMake ptr _ _ )) -> ptr
+(SliceLen (SliceMake _ len _)) -> len
+(SliceCap (SliceMake _ _ cap)) -> cap
+```
+
+除了获取切片的长度和容量之外，访问切片中元素使用的 `OINDEX` 操作也会在中间代码生成期间转换成**对地址的直接访问**：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/ssa.go
+func (s *state) expr(n *Node) *ssa.Value {
+	switch n.Op {
+	case OINDEX:
+		switch {
+		case n.Left.Type.IsSlice():
+			p := s.addr(n, false)
+			return s.load(n.Left.Type.Elem(), p)
+		...
+		}
+	...
+	}
+}
+```
+
+切片的操作基本都是在编译期间完成的，除了访问切片的长度、容量或者其中的元素之外，编译期间也会将包含 `range` 关键字的遍历转换成形式更简单的循环。
 
 
 
