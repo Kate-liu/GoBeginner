@@ -50,4 +50,11 @@ func main() {
 	fmt.Println(arr9[-1])         // invalid array index -1 (index must be non-negative) 错误：下标值不能为负数
 	fmt.Println(arr9[99])         // invalid array index 99 (out of bounds for 5-element array) 错误：下标值超出了arr的长度范围
 
+	// 数组访问越界报错区分
+	// var arr10 = [5]int{11, 12, 13, 14, 15}
+	// var ind = 6
+	// fmt.Println(arr10)
+	// fmt.Println(arr10[6])   // 编译器报错：invalid array index 6 (out of bounds for 5-element array)
+	// fmt.Println(arr10[ind]) // 运行时报错：panic: runtime error: index out of range [6] with length 5
+
 }
