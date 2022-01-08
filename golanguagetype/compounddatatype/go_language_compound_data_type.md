@@ -1442,6 +1442,57 @@ fmt.Println(m3) // map[{25.352594 113.304361}:shopping-mall {29.935523 52.568915
 
 以后在无特殊说明的情况下，都将使用这种简化后的字面值初始化方式。 
 
+这种使用字面量初始化的方式最终都会通过 `cmd/compile/internal/gc.maplit` 初始化，来分析一下该函数初始化哈希的过程：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/sinit.go
+func maplit(n *Node, m *Node, init *Nodes) {
+	a := nod(OMAKE, nil, nil)
+	a.Esc = n.Esc
+	a.List.Set2(typenod(n.Type), nodintconst(int64(n.List.Len())))
+	litas(m, a, init)
+
+	entries := n.List.Slice()
+	if len(entries) > 25 {
+		...
+		return
+	}
+
+  // For a small number of entries, just add them directly.
+	// Build list of var[c] = expr.
+	// Use temporaries so that mapassign1 can have addressable key, elem.
+	...
+}
+```
+
+当哈希表中的元素数量少于或者等于 25 个时，编译器会将字面量初始化的结构体转换成以下的代码，将所有的键值对一次加入到哈希表中：
+
+```go
+hash := make(map[string]int, 3)
+hash["1"] = 2
+hash["3"] = 4
+hash["5"] = 6
+```
+
+这种初始化的方式与的数组和切片几乎完全相同，由此看来集合类型的初始化在 Go 语言中有着相同的处理逻辑。
+
+一旦哈希表中元素的数量超过了 25 个，编译器会创建两个数组分别存储键和值，这些键值对会通过如下所示的 for 循环加入哈希：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/sinit.go
+// For a large number of entries, put them in an array and loop.
+hash := make(map[string]int, 26)
+vstatk := []string{"1", "2", "3", ... ， "26"}
+vstatv := []int{1, 2, 3, ... , 26}
+for i := 0; i < len(vstak); i++ {
+    hash[vstatk[i]] = vstatv[i]
+}
+```
+
+这里展开的两个切片 `vstatk` 和 `vstatv` 还会被编辑器继续展开，具体的展开方式可以参考切片的初始化，不过无论使用哪种方法，使用字面量初始化的过程都会使用 Go 语言中的关键字 `make` 来创建新的哈希并通过最原始的 `[]` 语法向哈希追加元素。
+
+
+
 #### make 初始化
 
 方法二：**使用 make 为 map 类型变量进行显式初始化**。
@@ -1455,6 +1506,107 @@ m5 := make(map[int]string, 8) // 指定初始容量为8
 ```
 
 不过，map 类型的容量不会受限于它的初始容量值，当其中的键值对数量超过初始容量后，Go 运行时会自动增加 map 类型的容量，保证后续键值对的正常插入。 
+
+当创建的哈希被分配到栈上并且其容量小于 `BUCKETSIZE = 8` 时，Go 语言在编译阶段会使用如下方式快速初始化哈希，这也是**编译器对小容量的哈希做的优化**：
+
+```go
+var h *hmap
+var hv hmap
+var bv bmap
+h := &hv
+b := &bv
+h.buckets = b
+h.hash0 = fashtrand0()
+```
+
+除了上述特定的优化之外，无论 `make` 是从哪里来的，只要使用 `make` 创建哈希，Go 语言编译器都会在类型检查期间将它们转换成 `runtime.makemap`。
+
+使用字面量初始化哈希也只是语言提供的辅助工具，最后调用的都是 `runtime.makemap`：
+
+```go
+// github.com/golang/go/src/runtime/map.go
+// makemap implements Go map creation for make(map[k]v, hint).
+func makemap(t *maptype, hint int, h *hmap) *hmap {
+	mem, overflow := math.MulUintptr(uintptr(hint), t.bucket.size)
+	if overflow || mem > maxAlloc {
+		hint = 0
+	}
+
+	if h == nil {
+		h = new(hmap)
+	}
+	h.hash0 = fastrand()
+
+	B := uint8(0)
+	for overLoadFactor(hint, B) {
+		B++
+	}
+	h.B = B
+
+	if h.B != 0 {
+		var nextOverflow *bmap
+		h.buckets, nextOverflow = makeBucketArray(t, h.B, nil)
+		if nextOverflow != nil {
+			h.extra = new(mapextra)
+			h.extra.nextOverflow = nextOverflow
+		}
+	}
+	return h
+}
+```
+
+这个函数会按照下面的步骤执行：
+
+1. 计算哈希占用的内存是否溢出或者超出能分配的最大值；
+2. 调用 `runtime.fastrand` 获取一个随机的哈希种子；
+3. 根据传入的 `hint` 计算出需要的最小需要的桶的数量；
+4. 使用 `runtime.makeBucketArray` 创建用于保存桶的数组；
+
+`runtime.makeBucketArray` 会根据传入的 `B` 计算出的需要创建的桶数量并在内存中分配一片连续的空间用于存储数据：
+
+```go
+// github.com/golang/go/src/runtime/map.go
+// makeBucketArray initializes a backing array for map buckets.
+func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets unsafe.Pointer, nextOverflow *bmap) {
+	base := bucketShift(b)
+	nbuckets := base
+  // For small b, overflow buckets are unlikely.
+	// Avoid the overhead of the calculation.
+	if b >= 4 {
+		nbuckets += bucketShift(b - 4)
+		sz := t.bucket.size * nbuckets
+		up := roundupsize(sz)
+		if up != sz {
+			nbuckets = up / t.bucket.size
+		}
+	}
+
+	buckets = newarray(t.bucket, int(nbuckets))
+	if base != nbuckets {
+		nextOverflow = (*bmap)(add(buckets, base*uintptr(t.bucketsize)))
+		last := (*bmap)(add(buckets, (nbuckets-1)*uintptr(t.bucketsize)))
+		last.setoverflow(t, (*bmap)(buckets))
+	}
+	return buckets, nextOverflow
+}
+```
+
+- 当桶的数量小于 2^4 时，由于数据较少、使用溢出桶的可能性较低，会省略创建的过程以减少额外开销；
+- 当桶的数量多于 2^4 时，会额外创建 2^(𝐵−4) 个溢出桶；
+
+根据上述代码，能确定在正常情况下，正常桶和溢出桶在内存中的存储空间是连续的，只是被 `runtime.hmap`中的不同字段引用，当溢出桶数量较多时会通过 `runtime.newobject` 创建新的溢出桶。
+
+```go
+// github.com/golang/go/src/runtime/malloc.go
+// implementation of new builtin
+// compiler (both frontend and SSA backend) knows the signature
+// of this function
+func newobject(typ *_type) unsafe.Pointer {
+   return mallocgc(typ.size, typ, true)
+}
+```
+
+
 
 ### map 的基本操作 
 
@@ -1573,6 +1725,95 @@ fmt.Println(ok1)  // false
 ```
 
 因此，一定要记住：在 Go 语言中，请使用“comma ok”惯用法对 map 进行键查找和键值读取操作。
+
+在编译的类型检查期间，`hash[key]` 以及类似的操作都会被转换成哈希的 `OINDEXMAP` 操作，中间代码生成阶段会在 `cmd/compile/internal/gc.walkexpr` 函数中将这些 `OINDEXMAP` 操作转换成如下的代码：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/walk.go
+func walkexpr(n *Node, init *Nodes) *Node {
+  ...
+  case OINDEXMAP:
+  // Replace m[k] with *map{access1,assign}(maptype, m, &k)
+  ...
+}
+
+// eg:
+v     := hash[key] // => v     := *mapaccess1(maptype, hash, &key)
+v, ok := hash[key] // => v, ok := mapaccess2(maptype, hash, &key)
+```
+
+赋值语句左侧接受参数的个数会决定使用的运行时方法：
+
+- 当接受一个参数时，会使用 `runtime.mapaccess1`，该函数仅会返回一个指向目标值的指针；
+- 当接受两个参数时，会使用 `runtime.mapaccess2`，除了返回目标值之外，它还会返回一个用于表示当前键对应的值是否存在的 `bool` 值：
+
+`runtime.mapaccess1` 会先通过哈希表设置的哈希函数、种子获取当前键对应的哈希，再通过 `runtime.bucketMask` 和 `runtime.add` 拿到该键值对所在的桶序号和哈希高位的 8 位数字。
+
+```go
+// github.com/golang/go/src/runtime/map.go
+func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
+	alg := t.key.alg
+	hash := alg.hash(key, uintptr(h.hash0))
+	m := bucketMask(h.B)
+	b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
+	top := tophash(hash)
+bucketloop:
+	for ; b != nil; b = b.overflow(t) {
+		for i := uintptr(0); i < bucketCnt; i++ {
+			if b.tophash[i] != top {
+				if b.tophash[i] == emptyRest {
+					break bucketloop
+				}
+				continue
+			}
+			k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
+			if alg.equal(key, k) {
+				v := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))
+				return v
+			}
+		}
+	}
+	return unsafe.Pointer(&zeroVal[0])
+}
+```
+
+在 `bucketloop` 循环中，哈希会依次遍历正常桶和溢出桶中的数据，它会先比较哈希的高 8 位和桶中存储的 `tophash`，后比较传入的和桶中的key值以加速数据的读写。
+
+用于选择桶序号的是哈希的最低几位，而用于加速访问的是哈希的高 8 位，这种设计能够减少同一个桶中有大量相等 `tophash` 的概率影响性能。
+
+每一个桶都是一整片的内存空间，当发现桶中的 `tophash` 与传入键的 `tophash` 匹配之后，会通过指针和偏移量获取哈希中存储的键 `keys[0]` 并与 `key` 比较，如果两者相同就会获取目标值的指针 `values[0]` 并返回。
+
+另一个同样用于访问哈希表中数据的 `runtime.mapaccess2` 只是在 `runtime.mapaccess1` 的基础上多返回了一个标识键值对是否存在的 `bool` 值：
+
+```go
+// github.com/golang/go/src/runtime/map.go
+func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) {
+	...
+bucketloop:
+	for ; b != nil; b = b.overflow(t) {
+		for i := uintptr(0); i < bucketCnt; i++ {
+			if b.tophash[i] != top {
+				if b.tophash[i] == emptyRest {
+					break bucketloop
+				}
+				continue
+			}
+			k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
+			if alg.equal(key, k) {
+				v := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))
+				return v, true
+			}
+		}
+	}
+	return unsafe.Pointer(&zeroVal[0]), false
+}
+```
+
+使用 `v, ok := hash[k]` 的形式访问哈希表中元素时，能够通过这个布尔值更准确地知道当 `v == nil` 时，`v` 到底是哈希中存储的元素还是表示该键对应的元素不存在，所以在访问哈希时，更推荐使用这种方式判断元素是否存在。
+
+上面的过程是在正常情况下，访问哈希表中元素时的表现，然而与数组一样，哈希表可能会在装载因子过高或者溢出桶过多时进行扩容，**哈希表扩容并不是原子过程**，在扩容的过程中保证哈希的访问是比较有意思的话题。
+
+
 
 #### 删除数据
 
@@ -1775,6 +2016,7 @@ delete(m, "key") → runtime.mapdelete(maptype, m, "key")
 源码：
 
 ```go
+// github.com/golang/go/src/runtime/map.go
 // A header for a Go map.
 type hmap struct {
    count     int // # live cells == size of map.  Must be first (used by len() builtin)
@@ -1788,6 +2030,19 @@ type hmap struct {
    nevacuate  uintptr        // progress counter for evacuation (buckets less than this have been evacuated)
 
    extra *mapextra // optional fields
+}
+
+// A bucket for a Go map.
+type bmap struct {
+	// tophash generally contains the top byte of the hash value
+	// for each key in this bucket. If tophash[0] < minTopHash,
+	// tophash[0] is a bucket evacuation state instead.
+	tophash [bucketCnt]uint8
+	// Followed by bucketCnt keys and then bucketCnt elems.
+	// NOTE: packing all the keys together and then all the elems together makes the
+	// code a bit more complicated than alternating key/elem/key/elem/... but it allows
+	// us to eliminate padding which would be needed for, e.g., map[int64]int8.
+	// Followed by an overflow pointer.
 }
 ```
 
@@ -1809,7 +2064,11 @@ const(
 
 当某个 bucket（比如 buckets[0]) 的 8 个**空槽 slot**）都填满了，且 map 尚未达到扩容的条件的情况下，**运行时会建立 overflow bucket**，并将这个 overflow bucket 挂在上面 bucket（如 buckets[0]）末尾的 overflow 指针上，这样两个 buckets 形成了一个**链表结构**，直到下一次 map 扩容之前，这个结构都会一直存在。 
 
+正常桶和溢出桶在内存中是连续存储的，**溢出桶**是在 Go 语言还使用 C 语言实现时使用的设计，由于它能够减少扩容的频率所以一直使用至今。
+
 从图中可以看到，每个 bucket 由三部分组成，从上到下分别是 tophash 区域、key 存储区域和 value 存储区域。
+
+
 
 #### tophash 区域
 
@@ -1824,6 +2083,29 @@ const(
 因此，每个 bucket 的 tophash 区域其实是用来快速定位 key 位置的，这样就避免了逐个 key 进行比较这种代价较大的操作。
 
 尤其是当 key 是 size 较大的字符串类型时，好处就更突出了。这是一种**以空间换时间**的思路。
+
+桶的结构体 `runtime.bmap` 在 Go 语言源代码中的定义只包含一个简单的 `tophash` 字段，`tophash` 存储了键的哈希的高 8 位，通过比较不同键的哈希的高 8 位可以减少访问键值对次数以提高性能。
+
+在运行期间，`runtime.bmap` 结构体其实不止包含 `tophash` 字段，因为哈希表中可能存储不同类型的键值对，而且 Go 语言也不支持泛型，所以键值对占据的内存空间大小只能在编译时进行推导。
+
+`runtime.bmap` 中的其他字段在运行时也都是通过计算内存地址的方式访问的，所以它的定义中就不包含这些字段，不过能根据编译期间的 `cmd/compile/internal/gc.bmap` 函数重建它的结构：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/reflect.go
+type bmap struct {
+    topbits  [8]uint8
+    keys     [8]keytype  // 键
+    values   [8]valuetype  // 值
+    pad      uintptr // 内存对齐 padding
+    overflow uintptr  // 溢出
+}
+```
+
+随着哈希表存储的数据逐渐增多，会扩容哈希表或者使用额外的桶存储溢出的数据，不会让单个桶中的数据超过 8 个，不过溢出桶只是临**时的解决方案，创建过多的溢出桶**最终也会导致哈希的扩容。
+
+从 Go 语言哈希的定义中可以发现，改进元素比数组和切片复杂得多，它的结构体中不仅包含大量字段，还使用**复杂的嵌套结构**。
+
+
 
 #### key 存储区域
 
