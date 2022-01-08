@@ -893,6 +893,8 @@ fmt.Println(len(s), cap(s)) // 5 8
 
 在上面这段代码中，针对元素是 int 型的数组，新数组的容量是当前数组的 2 倍。新数组建立后，append 会把旧数组中的数据拷贝到新数组中，之后新数组便成为了切片的底层数组，旧数组会被垃圾回收掉。 
 
+#### ssa 访问切片元素
+
 使用 `len` 和 `cap` 获取长度或者容量是切片最常见的操作，编译器将它们看成两种特殊操作，即 `OLEN` 和 `OCAP`，`cmd/compile/internal/gc.state.expr` 函数会在 SSA 生成 阶段将它们分别转换成 `OpSliceLen` 和 `OpSliceCap`：
 
 ```go
@@ -944,6 +946,196 @@ func (s *state) expr(n *Node) *ssa.Value {
 
 切片的操作基本都是在编译期间完成的，除了访问切片的长度、容量或者其中的元素之外，编译期间也会将包含 `range` 关键字的遍历转换成形式更简单的循环。
 
+#### 切片容量足够时向切片中追加元素
+
+使用 `append` 关键字向切片中追加元素也是常见的切片操作，中间代码生成阶段的 `cmd/compile/internal/gc.state.append` 方法会根据返回值是否会覆盖原变量，选择进入两种流程。
+
+如果 `append` 返回的新切片**不需要赋值回原有的变量**，就会进入如下的处理流程：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/ssa.go
+// append(slice, 1, 2, 3)
+ptr, len, cap := slice
+newlen := len + 3
+if newlen > cap {
+    ptr, len, cap = growslice(slice, newlen)
+    newlen = len + 3
+}
+*(ptr+len) = 1
+*(ptr+len+1) = 2
+*(ptr+len+2) = 3
+return makeslice(ptr, newlen, cap)
+```
+
+先解构切片结构体获取它的数组指针、大小和容量，如果在追加元素后切片的大小大于容量，那么就会调用 `runtime.growslice`  对切片进行扩容并将新的元素依次加入切片。
+
+如果使用 `slice = append(slice, 1, 2, 3)` 语句，那么 `append` 后的切片会覆盖原切片，这时 `cmd/compile/internal/gc.state.append` 方法会使用另一种方式展开关键字：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/ssa.go
+// slice = append(slice, 1, 2, 3)
+a := &slice
+ptr, len, cap := slice
+newlen := len + 3
+if uint(newlen) > uint(cap) {
+   newptr, len, newcap = growslice(slice, newlen)
+   vardef(a)
+   *a.cap = newcap
+   *a.ptr = newptr
+}
+newlen = len + 3
+*a.len = newlen
+*(ptr+len) = 1
+*(ptr+len+1) = 2
+*(ptr+len+2) = 3
+```
+
+是否覆盖原变量的逻辑其实差不多，最大的区别在于得到的新切片是否会赋值回原变量。
+
+如果选择覆盖原有的变量，就不需要担心切片发生拷贝影响性能，因为 Go 语言编译器已经对这种常见的情况做出了优化。
+
+#### 切片容量不足时向切片中追加元素
+
+到这里已经清楚了 Go 语言如何在切片容量足够时向切片中追加元素，不过仍然需要研究切片容量不足时的处理流程。
+
+##### 确定切片的容量
+
+当切片的容量不足时，会调用 `runtime.growslice` 函数为切片扩容，扩容是**为切片分配新的内存空间并拷贝原切片中元素的过程**，先来看新切片的容量是如何确定的：
+
+```go
+// github.com/golang/go/src/runtime/slice.go
+// growslice handles slice growth during append.
+// It is passed the slice element type, the old slice, and the desired new minimum capacity,
+// and it returns a new slice with at least that capacity, with the old data
+// copied into it.
+// The new slice's length is set to the old slice's length,
+// NOT to the new requested capacity.
+// This is for codegen convenience. The old slice's length is used immediately
+// to calculate where to write new values during an append.
+// TODO: When the old backend is gone, reconsider this decision.
+// The SSA backend might prefer the new length or to return only ptr/cap and save stack space.
+func growslice(et *_type, old slice, cap int) slice {
+	newcap := old.cap
+	doublecap := newcap + newcap
+	if cap > doublecap {
+		newcap = cap
+	} else {
+		if old.len < 1024 {
+			newcap = doublecap
+		} else {
+			for 0 < newcap && newcap < cap {
+				newcap += newcap / 4
+			}
+			if newcap <= 0 {
+				newcap = cap
+			}
+		}
+	}
+```
+
+在分配内存空间之前需要先确定新的切片容量，运行时根据切片的当前容量选择**不同的策略**进行扩容：
+
+1. 如果期望容量大于当前容量的两倍就会使用期望容量；
+2. 如果当前切片的长度小于 1024字节 就会将容量翻倍；
+3. 如果当前切片的长度大于 1024字节 就会每次增加 25% 的容量，直到新容量大于期望容量；
+
+##### 对齐内存
+
+上述代码片段仅会确定切片的大致容量，下面还需要根据切片中的元素大小**对齐内存**，当数组中元素所占的字节大小为 1、8 或者 2 的倍数时，运行时会使用如下所示的代码对齐内存：
+
+```go
+// github.com/golang/go/src/runtime/slice.go
+	var overflow bool
+	var lenmem, newlenmem, capmem uintptr
+	switch {
+	case et.size == 1:
+		lenmem = uintptr(old.len)
+		newlenmem = uintptr(cap)
+    // github.com/golang/go/src/runtime/msize.go
+		capmem = roundupsize(uintptr(newcap))
+		overflow = uintptr(newcap) > maxAlloc
+		newcap = int(capmem)
+	case et.size == sys.PtrSize:
+		lenmem = uintptr(old.len) * sys.PtrSize
+		newlenmem = uintptr(cap) * sys.PtrSize
+		capmem = roundupsize(uintptr(newcap) * sys.PtrSize)
+		overflow = uintptr(newcap) > maxAlloc/sys.PtrSize
+		newcap = int(capmem / sys.PtrSize)
+	case isPowerOfTwo(et.size):
+		...
+	default:
+		...
+	}
+```
+
+`runtime.roundupsize` 函数会将待申请的内存**向上取整**，取整时会使用 `runtime.class_to_size` 数组，使用**该数组中的整数可以提高内存的分配效率并减少碎片**：
+
+```go
+// github.com/golang/go/src/runtime/sizeclasses.go
+var class_to_size = [_NumSizeClasses]uint16{
+    0,
+    8,
+    16,
+    32,
+    48,
+    64,
+    80,
+    ...,
+}
+```
+
+##### 内存溢出崩溃
+
+在默认情况下，会将目标容量和元素大小相乘得到占用的内存。
+
+如果计算新容量时发生了内存溢出或者请求内存超过上限，就会**直接崩溃退出**程序，不过这里为了减少理解的成本，将相关的代码省略了。
+
+```go
+// github.com/golang/go/src/runtime/slice.go
+  var overflow bool
+	var newlenmem, capmem uintptr
+	switch {
+	...
+	default:
+		lenmem = uintptr(old.len) * et.size
+		newlenmem = uintptr(cap) * et.size
+		capmem, _ = math.MulUintptr(et.size, uintptr(newcap))
+		capmem = roundupsize(capmem)
+		newcap = int(capmem / et.size)
+	}
+	...
+	var p unsafe.Pointer
+	if et.kind&kindNoPointers != 0 {
+		p = mallocgc(capmem, nil, false)
+    // github.com/golang/go/src/runtime/stubs.go
+		memclrNoHeapPointers(add(p, newlenmem), capmem-newlenmem)
+	} else {
+		p = mallocgc(capmem, et, true)
+		if writeBarrier.enabled {
+			bulkBarrierPreWriteSrcOnly(uintptr(p), uintptr(old.array), lenmem)
+		}
+	}
+	// github.com/golang/go/src/runtime/stubs.go
+	memmove(p, old.array, lenmem)
+	return slice{p, old.len, newcap}  // 返回新的切片
+}
+```
+
+如果切片中元素不是指针类型，那么会调用 `runtime.memclrNoHeapPointers`  将超出切片当前长度的位置清空并在最后使用 `runtime.memmove` 将原数组内存中的内容拷贝到新申请的内存中。这两个方法都是用目标机器上的汇编指令实现的。
+
+`runtime.growslice` 函数最终会返回一个新的切片，其中包含了新的数组指针、大小和容量，这个返回的三元组最终会覆盖原切片。
+
+```go
+var arr []int64
+arr = append(arr, 1, 2, 3, 4, 5)
+```
+
+##### 小结
+
+简单总结一下扩容的过程，当执行上述代码时，会触发 `runtime.growslice` 函数扩容 `arr` 切片并传入期望的新容量 5，这时期望分配的内存大小为 40 字节；不过因为切片中的元素大小等于 `sys.PtrSize`，所以运行时会调用 `runtime.roundupsize` 向上取整内存的大小到 48 字节，所以新切片的容量为 48 / 8 = 6。
+
+
+
 
 
 ### 动态扩容导致解除绑定问题
@@ -994,6 +1186,65 @@ after reassign 1st elem of slice, slice(len=5, cap=8): [22 13 24 25 26]
 在这之后，即便再修改切片的第一个元素值，原数组 u 的元素也不会发生改变了，因 为这个时候切片 s 与数组 u 已经解除了“绑定关系”，s 已经不再是数组 u 的“描述符”了。
 
 这种因切片的自动扩容而导致的“绑定关系”解除，有时候会成为实践道路上的一个小陷阱。
+
+
+
+### 切片的拷贝
+
+切片的拷贝虽然不是常见的操作，但是却是学习切片实现原理必须要涉及的。
+
+当使用 `copy(a, b)` 的形式对切片进行拷贝时，编译期间的 `cmd/compile/internal/gc.copyany` 也会分两种情况进行处理拷贝操作。
+
+如果当前 `copy` **不是在**运行时调用的，`copy(a, b)` 会被直接转换成下面的代码：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/walk.go
+n := len(a)
+if n > len(b) {
+    n = len(b)
+}
+if a.ptr != b.ptr {
+  	// github.com/golang/go/src/runtime/stubs.go
+    memmove(a.ptr, b.ptr, n*sizeof(elem(a))) 
+}
+```
+
+上述代码中的 `runtime.memmove` 会负责拷贝内存。
+
+而如果拷贝**是在**运行时发生的，例如：`go copy(a, b)`，编译器会使用 `runtime.slicecopy` 替换运行期间调用的 `copy`，该函数的实现很简单：
+
+```go
+// github.com/golang/go/src/runtime/slice.go
+// slicecopy is used to copy from a string or slice of pointerless elements into a slice.
+func slicecopy(to, fm slice, width uintptr) int {
+	if fm.len == 0 || to.len == 0 {
+		return 0
+	}
+	n := fm.len
+	if to.len < n {
+		n = to.len
+	}
+	if width == 0 {
+		return n
+	}
+	...
+
+	size := uintptr(n) * width
+	if size == 1 {
+		*(*byte)(to.array) = *(*byte)(fm.array)
+	} else {
+    // github.com/golang/go/src/runtime/stubs.go
+		memmove(to.array, fm.array, size)
+	}
+	return n
+}
+```
+
+无论是编译期间拷贝还是运行时拷贝，两种拷贝方式都会通过 `runtime.memmove` 将整块内存的内容拷贝到目标的内存区域中：
+
+相比于依次拷贝元素，`runtime.memmove`能够提供更好的性能。
+
+需要注意的是，整块拷贝内存仍然会**占用非常多的资源**，在大切片上执行拷贝操作时一定要注意对性能的影响。
 
 
 
