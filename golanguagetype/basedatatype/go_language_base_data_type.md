@@ -628,12 +628,13 @@ Go 语言修正了这个缺陷，Go 字符串中没有结尾’\0’，获取字
 
 如果要在 C 语言中构造多行字符串，一般就是两个方法：要么使用多个字符串的自然拼接，要么需要结合续行符""。但因为有转义字符的存在，很难控制好格式。
 
-Go 语言就简单多了，通过一对反引号原生支持构造“所见即所得”的原始字符串（Raw String）。
+Go 语言就简单多了，通过一对**反引号原生支持**构造“所见即所得”的原始字符串（Raw String）。反引号声明的字符串可以摆脱单行的限制，可以在字符串内部直接使用 `"`，在遇到需要手写 JSON 或者其他复杂数据格式的场景下非常方便。
 
 而且，Go 语言原始字符串中的任意转义字符都不会起到转义的作用。比如下面这段代码：
 
 ```go
 // string 类型的数据所见即所得
+// 反引号
 var s string = `         
             ,_---~~~~~----._
    _,,_,*^____      _____*g*\"*,--,
@@ -860,6 +861,18 @@ type StringHeader struct {
 
 string 类型其实是一个“描述符”，它本身并不真正存储字符串数据，而仅是由一个指向底层存储的指针和字符串的长度字段组成的。
 
+与切片的结构体相比，字符串只少了一个表示容量的 `Cap` 字段，而正是因为切片在 Go 语言的运行时表示与字符串高度相似，所以经常会说**字符串是一个只读的切片类型**。
+
+```go
+// github.com/golang/go/src/reflect/value.go
+// SliceHeader is the runtime representation of a slice.
+type SliceHeader struct {
+	Data uintptr
+	Len  int
+	Cap  int
+}
+```
+
 画了一张图，直观地展示了一个 string 类型变量在 Go 内存中的存储：
 
 ![image-20211224131933831](go_language_base_data_type.assets/image-20211224131933831.png)
@@ -893,6 +906,107 @@ func main() {
 之所以是常数时间，那是因为**字符串类型中包含了字符串长度信息**，当用 len 函数获取字符串长度时，len 函数只要简单地将这个信息提取出来就可以了。
 
 了解了 string 类型的实现原理后，还可以得到这样一个结论，那就是直接将 string 类型通过函数 / 方法参数传入也不会带来太多的开销。因为**传入的仅仅是一个“描 述符”**，而不是真正的字符串数据。 
+
+#### 字符串源码解析
+
+解析字符串使用的扫描器 `cmd/compile/internal/syntax.scanner` 会将输入的字符串转换成 Token 流。
+
+##### 解析使用双引号的标准字符串
+
+`cmd/compile/internal/syntax.scanner.stdString` 方法是它用来解析使用双引号的标准字符串：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/syntax/scanner.go
+// 解析使用双引号的标准字符串
+func (s *scanner) stdString() {
+	s.startLit()
+	for {
+		r := s.getr()
+		if r == '"' {
+			break
+		}
+		if r == '\\' {
+			s.escape('"')
+			continue
+		}
+		if r == '\n' {
+			s.ungetr()
+			s.error("newline in string")
+			break
+		}
+		if r < 0 {
+			s.errh(s.line, s.col, "string not terminated")
+			break
+		}
+	}
+	s.nlsemi = true
+	s.lit = string(s.stopLit())
+	s.kind = StringLit
+	s.tok = _Literal
+}
+```
+
+从这个方法的实现能分析出 Go 语言处理标准字符串的逻辑：
+
+1. 标准字符串使用双引号表示开头和结尾；
+2. 标准字符串需要使用反斜杠 `\` 来逃逸双引号；
+3. 标准字符串不能出现如下所示的隐式换行 `\n`；
+
+```go
+str := "start
+end"
+```
+
+##### 解析使用反引号的标准字符串
+
+使用反引号声明的原始字符串的解析规则就非常简单了，`cmd/compile/internal/syntax.scanner.rawString` 会将非反引号的所有字符都划分到当前字符串的范围中，所以可以使用它支持复杂的多行字符串：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/syntax/scanner.go
+// 解析使用反引号的标准字符串
+func (s *scanner) rawString() {
+	s.startLit()
+	for {
+		r := s.getr()
+		if r == '`' {
+			break
+		}
+		if r < 0 {
+			s.errh(s.line, s.col, "string not terminated")
+			break
+		}
+	}
+	s.nlsemi = true
+	s.lit = string(s.stopLit())
+	s.kind = StringLit
+	s.tok = _Literal
+}
+```
+
+无论是标准字符串还是原始字符串都会被标记成 `StringLit` 并传递到语法分析阶段。
+
+在语法分析阶段，与字符串相关的表达式都会由 `cmd/compile/internal/gc.noder.basicLit` 方法处理：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/noder.go
+func (p *noder) basicLit(lit *syntax.BasicLit) Val {
+	switch s := lit.Value; lit.Kind {
+	case syntax.StringLit:
+		if len(s) > 0 && s[0] == '`' {
+      // strip carriage returns from raw string
+			s = strings.Replace(s, "\r", "", -1)
+		}
+		u, _ := strconv.Unquote(s)
+		return Val{U: u}
+	}
+}
+```
+
+无论是 `import` 语句中包的路径、结构体中的字段标签还是表达式中的字符串都会使用这个方法**将原生字符串中最后的换行符删除**并**对字符串 Token 进行 Unquote**，也就是去掉字符串两边的引号等无关干扰，还原其本来的面目。
+
+`strconv.Unquote` 处理了很多边界条件导致实现非常复杂，其中不仅包括引号，还包括 UTF-8 等编码的处理逻辑。
+
+
 
 ### Go 字符串类型的常见操作 
 
@@ -1098,6 +1212,102 @@ fmt.Println(v) // Rob Pike, Robert Griesemer, Ken Thompson
 
   - +/+=是将两个字符串连接后分配一个新的空间，当连接字符串的数量少时，两者没有什么区别，但是当连接字符串多时，Builder的效率要比+/+=的效率高很多。
 
+##### 字符串连接源码分析
+
+Go 语言拼接字符串会使用 `+` 符号，编译器会将该符号对应的 `OADD` 节点转换成 `OADDSTR` 类型的节点，随后在 `cmd/compile/internal/gc.walkexpr` 中调用 `cmd/compile/internal/gc.addstr` 函数生成用于拼接字符串的代码：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/walk.go
+func walkexpr(n *Node, init *Nodes) *Node {
+	switch n.Op {
+	...
+	case OADDSTR:
+		n = addstr(n, init)
+	}
+}
+```
+
+`cmd/compile/internal/gc.addstr` 能在编译期间**选择合适的函数对字符串进行拼接**，该函数会根据带拼接的字符串数量选择不同的逻辑：
+
+- 如果小于或者等于 5 个，那么会调用 `concatstring{2,3,4,5}` 等一系列函数；
+- 如果超过 5 个，那么会选择 `runtime.concatstrings` 传入一个数组切片；
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/walk.go
+func addstr(n *Node, init *Nodes) *Node {
+	c := n.List.Len()
+
+	buf := nodnil()
+	args := []*Node{buf}
+	for _, n2 := range n.List.Slice() {
+		args = append(args, conv(n2, types.Types[TSTRING]))
+	}
+
+	var fn string
+	if c <= 5 {
+    // small numbers of strings use direct runtime helpers.
+		// note: order.expr knows this cutoff too.
+		fn = fmt.Sprintf("concatstring%d", c)
+	} else {
+    // large numbers of strings are passed to the runtime as a slice.
+		fn = "concatstrings"
+
+		t := types.NewSlice(types.Types[TSTRING])
+		slice := nod(OCOMPLIT, nil, typenod(t))
+		slice.List.Set(args[1:])
+		args = []*Node{buf, slice}
+	}
+
+	cat := syslook(fn)
+	r := nod(OCALL, cat, nil)
+	r.List.Set(args)
+	...
+
+	return r
+}
+```
+
+其实无论使用 `concatstring{2,3,4,5}` 中的哪一个，最终都会调用 `runtime.concatstrings`，它会先对遍历传入的切片参数，再过滤空字符串并计算拼接后字符串的长度。
+
+```go
+// github.com/golang/go/src/runtime/string.go
+func concatstrings(buf *tmpBuf, a []string) string {
+	idx := 0
+	l := 0
+	count := 0
+	for i, x := range a {
+		n := len(x)
+		if n == 0 {
+			continue
+		}
+		l += n
+		count++
+		idx = i
+	}
+	if count == 0 {
+		return ""
+	}
+  // If there is just one string and either it is not on the stack
+	// or our result does not escape the calling frame (buf != nil),
+	// then we can return that string directly.
+	if count == 1 && (buf != nil || !stringDataOnStack(a[idx])) {
+		return a[idx]
+	}
+	s, b := rawstringtmp(buf, l)
+	for _, x := range a {
+		copy(b, x)
+		b = b[len(x):]
+	}
+	return s
+}
+```
+
+如果非空字符串的数量为 1 并且当前的字符串不在栈上，就可以直接返回该字符串，不需要做出额外操作。
+
+但是在正常情况下，运行时会调用 `copy` 将输入的多个字符串拷贝到目标字符串所在的内存空间。新的字符串是一片**新的内存空间**，与原来的字符串也没有任何关联，一旦需要拼接的字符串非常大，拷贝带来的**性能损失**是无法忽略的。
+
+
+
 #### 字符串比较
 
 第四个操作：字符串比较。 
@@ -1166,6 +1376,74 @@ fmt.Println(w2) // 中国人
 ```
 
 这样的转型看似简单，但无论是 string 转切片，还是切片转 string，这类转型背后也是有着一定**开销**的。这些开销的根源就在于 string 是不可变的，运行时要为转换后的类型**分配新内存**。
+
+##### 字符串转换源码分析
+
+当使用 Go 语言解析和序列化 JSON 等数据格式时，经常需要将数据在 `string` 和 `[]byte` 之间来回转换，**类型转换的开销**并没有想象的那么小，经常会看到 `runtime.slicebytetostring` 等函数出现在[火焰图](https://www.brendangregg.com/flamegraphs.html)中，成为程序的性能热点。
+
+###### 字节数组转字符串
+
+从字节数组到字符串的转换需要使用 `runtime.slicebytetostring` 函数。
+
+例如：`string(bytes)`，该函数在函数体中会先处理两种比较常见的情况，也就是长度为 0 或者 1 的字节数组，这两种情况处理起来都非常简单：
+
+```go
+// github.com/golang/go/src/runtime/string.go
+// slicebytetostring converts a byte slice to a string.
+func slicebytetostring(buf *tmpBuf, b []byte) (str string) {
+	l := len(b)
+	if l == 0 {
+		return ""
+	}
+	if l == 1 {
+		stringStructOf(&str).str = unsafe.Pointer(&staticbytes[b[0]])
+		stringStructOf(&str).len = 1
+		return
+	}
+	var p unsafe.Pointer
+	if buf != nil && len(b) <= len(buf) {
+		p = unsafe.Pointer(buf)
+	} else {
+		p = mallocgc(uintptr(len(b)), nil, false)
+	}
+	stringStructOf(&str).str = p
+	stringStructOf(&str).len = len(b)
+	memmove(p, (*(*slice)(unsafe.Pointer(&b))).array, uintptr(len(b)))
+	return
+}
+```
+
+处理过后会根据传入的缓冲区大小决定是否需要为新字符串分配一片内存空间，`runtime.stringStructOf` 会将传入的字符串指针转换成 `runtime.stringStruct` 结构体指针，然后设置结构体持有的字符串指针 `str` 和长度 `len`，最后通过 `runtime.memmove` 将原 `[]byte` 中的字节全部复制到新的内存空间中。
+
+###### 字符串转字节数组
+
+当想要将字符串转换成 `[]byte` 类型时，需要使用 `runtime.stringtoslicebyte` 函数，该函数的实现非常容易理解：
+
+```go
+func stringtoslicebyte(buf *tmpBuf, s string) []byte {
+	var b []byte
+	if buf != nil && len(s) <= len(buf) {
+		*buf = tmpBuf{}
+		b = buf[:len(s)]
+	} else {
+    // rawbyteslice allocates a new byte slice. The byte slice is not zeroed.
+		b = rawbyteslice(len(s))
+	}
+	copy(b, s)
+	return b
+}
+```
+
+上述函数会根据是否传入缓冲区做出不同的处理：
+
+- 当传入缓冲区时，它会使用传入的缓冲区存储 `[]byte`；
+- 当没有传入缓冲区时，运行时会调用 `runtime.rawbyteslice` 创建新的字节切片并将字符串中的内容拷贝过去；
+
+字符串和 `[]byte` 中的内容虽然一样，但是字符串的内容是只读的，不能通过下标或者其他形式改变其中的数据，而 `[]byte` 中的内容是可以读写的。
+
+不过无论从哪种类型转换到另一种都需要拷贝数据，而内存拷贝的**性能损耗会随着字符串和 `[]byte` 长度的增长而增长**。
+
+
 
 ## 小结 
 
