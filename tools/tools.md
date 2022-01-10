@@ -133,6 +133,10 @@ gclocals·69c1753bd5f81501d95132d08af04464 SRODATA dupok size=8
 os.(*File).close.arginfo1 SRODATA static dupok size=3
         0x0000 00 08 ff                                         ...
 
+
+# 或者使用这条命令
+# 如果编译时不使用 -N -l 参数，编译器会对汇编代码进行优化，编译结果会有较大差别。
+$go tool compile -S -N -l main.go
 ```
 
 
@@ -144,6 +148,64 @@ os.(*File).close.arginfo1 SRODATA static dupok size=3
 > The details vary with architecture, and we apologize for the imprecision; the situation is **not well-defined**.
 
 参考链接：**A Manual for the Plan 9 assembler**：https://9p.io/sys/doc/asm.html
+
+
+
+## C 命令行工具
+
+### C 代码转换为汇编代码
+
+可以使用 `cc -S my_function.c` 命令将 `my_function.c` 文件编译成如下所示的汇编代码:
+
+```sh
+$cat my_function.c
+int my_function(int arg1, int arg2) {
+    return arg1 + arg2;
+}
+
+int main() {
+    int i = my_function(1, 2);
+}
+
+$cc -S my_function.c
+$cat my_function.s
+  ..
+my_function:
+.LFB0:
+	.cfi_startproc
+	pushq	%rbp
+	.cfi_def_cfa_offset 16
+	.cfi_offset 6, -16
+	movq	%rsp, %rbp
+	.cfi_def_cfa_register 6
+	movl	%edi, -4(%rbp)
+	movl	%esi, -8(%rbp)
+	movl	-4(%rbp), %edx
+	movl	-8(%rbp), %eax
+	addl	%edx, %eax
+	...
+main:
+.LFB1:
+	.cfi_startproc
+	pushq	%rbp
+	.cfi_def_cfa_offset 16
+	.cfi_offset 6, -16
+	movq	%rsp, %rbp
+	.cfi_def_cfa_register 6
+	subq	$16, %rsp
+	movl	$2, %esi
+	movl	$1, %edi
+	call	my_function
+	movl	%eax, -4(%rbp)
+	movl	$0, %eax
+	...
+```
+
+
+
+
+
+
 
 
 
