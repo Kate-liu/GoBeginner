@@ -152,6 +152,8 @@ myAppend 函数通过 Printf 输出了变长参数的类型。执行这段代码
 
 这也就说明，在 Go 中，**变长参数实际上是通过切片来实现的**。所以，在函数体中， 就可以使用切片支持的所有操作来操作变长参数，这会大大简化了变长参数的使用复杂 度。比如 myAppend 中，使用 len 函数就可以获取到传给变长参数的实参个数。 
 
+
+
 #### 函数支持多返回值 
 
 和其他主流静态类型语言，比如 C、C++ 和 Java 不同，Go 函数支持多返回值。
@@ -465,7 +467,7 @@ func main() {
 
 
 
-### 函数调用惯例
+### 函数调用惯例源码解析
 
 无论是系统级编程语言 C 和 Go，还是脚本语言 Ruby 和 Python，这些编程语言在调用函数时往往都使用相同的语法：
 
@@ -705,6 +707,178 @@ C 语言和 Go 语言在设计函数的调用惯例时选择了不同的实现�
   - 函数入参和出参的内存空间需要在栈上进行分配；
 
 Go 语言使用栈作为参数和返回值传递的方法是综合考虑后的设计，选择这种设计意味着编译器会更加简单、更容易维护。
+
+
+
+### 函数参数传递源码解析
+
+除了函数的调用惯例之外，Go 语言在传递参数时是传值还是传引用也是一个有趣的问题，不同的选择会影响在函数中修改入参时是否会影响调用方看到的数据。
+
+先来介绍一下传值和传引用两者的区别：
+
+- 传值：函数调用时会对参数进行拷贝，被调用方和调用方两者持有不相关的两份数据；
+- 传引用：函数调用时会传递参数的指针，被调用方和调用方两者持有相同的数据，任意一方做出的修改都会影响另一方。
+
+不同语言会选择不同的方式传递参数，Go 语言选择了传值的方式，**无论是传递基本类型、结构体还是指针，都会对传递的参数进行拷贝**。
+
+#### 整型和数组
+
+先来分析 Go 语言是如何传递基本类型和数组的。
+
+如下所示的函数 `myFunction` 接收了两个参数，整型变量 `i` 和数组 `arr`，这个函数会将传入的两个参数的地址打印出来，在最外层的主函数也会在 `myFunction` 函数调用前后分别打印两个参数的地址：
+
+```go
+func myFunction(i int, arr [2]int) {
+	fmt.Printf("in my_funciton - i=(%d, %p) arr=(%v, %p)\n", i, &i, arr, &arr)
+}
+
+func main() {
+	i := 30
+	arr := [2]int{66, 77}
+	fmt.Printf("before calling - i=(%d, %p) arr=(%v, %p)\n", i, &i, arr, &arr)
+	myFunction(i, arr)
+	fmt.Printf("after  calling - i=(%d, %p) arr=(%v, %p)\n", i, &i, arr, &arr)
+}
+
+$ go run main.go
+before calling - i=(30, 0xc00009a000) arr=([66 77], 0xc00009a010)
+in my_funciton - i=(30, 0xc00009a008) arr=([66 77], 0xc00009a020)
+after  calling - i=(30, 0xc00009a000) arr=([66 77], 0xc00009a010)
+```
+
+当通过命令运行这段代码时会发现，`main` 函数和被调用者 `myFunction` 中参数的地址是完全不同的。
+
+不过从 `main` 函数的角度来看，在调用 `myFunction` 前后，整数 `i` 和数组 `arr` 两个参数的地址都没有变化。
+
+那么如果在 `myFunction` 函数内部对参数进行修改是否会影响 `main` 函数中的变量呢？这里更新 `myFunction` 函数并重新执行这段代码：
+
+```go
+func myFunction(i int, arr [2]int) {
+	i = 29
+	arr[1] = 88
+	fmt.Printf("in my_funciton - i=(%d, %p) arr=(%v, %p)\n", i, &i, arr, &arr)
+}
+
+$ go run main.go
+before calling - i=(30, 0xc000072008) arr=([66 77], 0xc000072010)
+in my_funciton - i=(29, 0xc000072028) arr=([66 88], 0xc000072040)
+after  calling - i=(30, 0xc000072008) arr=([66 77], 0xc000072010)
+```
+
+可以看到在 `myFunction` 中对参数的修改也仅仅影响了当前函数，并没有影响调用方 `main` 函数。
+
+所以能得出如下结论：**Go 语言的整型和数组类型都是值传递的**，也就是在调用函数时会对内容进行拷贝。
+
+需要注意的是如果当前数组的大小非常的大，这种传值的方式会对**性能**造成比较大的影响。
+
+
+
+#### 结构体和指针
+
+接下来继续分析 Go 语言另外两种常见类型 — 结构体和指针。
+
+下面这段代码中定义了一个结构体 `MyStruct` 以及接受两个参数的 `myFunction` 方法：
+
+```go
+type MyStruct struct {
+	i int
+}
+
+func myFunction(a MyStruct, b *MyStruct) {
+	a.i = 31
+	b.i = 41
+	fmt.Printf("in my_function - a=(%d, %p) b=(%v, %p)\n", a, &a, b, &b)
+}
+
+func main() {
+	a := MyStruct{i: 30}
+	b := &MyStruct{i: 40}
+	fmt.Printf("before calling - a=(%d, %p) b=(%v, %p)\n", a, &a, b, &b)
+	myFunction(a, b)
+	fmt.Printf("after calling  - a=(%d, %p) b=(%v, %p)\n", a, &a, b, &b)
+}
+
+$ go run main.go
+before calling - a=({30}, 0xc000018178) b=(&{40}, 0xc00000c028)
+in my_function - a=({31}, 0xc000018198) b=(&{41}, 0xc00000c038)
+after calling  - a=({30}, 0xc000018178) b=(&{41}, 0xc00000c028)
+```
+
+从上述运行的结果可以得出如下结论：
+
+- 传递结构体时：会拷贝结构体中的全部内容；
+- 传递结构体指针时：会拷贝结构体指针；
+
+修改结构体指针是改变了指针指向的结构体，`b.i` 可以被理解成 `(*b).i`，也就是先获取指针 `b` 背后的结构体，再修改结构体的成员变量。
+
+简单修改上述代码，分析一下 **Go 语言结构体在内存中的布局**：
+
+```go
+type MyStruct struct {
+	i int
+	j int
+}
+
+func myFunction(ms *MyStruct) {
+	ptr := unsafe.Pointer(ms)
+	for i := 0; i < 2; i++ {
+		c := (*int)(unsafe.Pointer((uintptr(ptr) + uintptr(8*i))))
+		*c += i + 1
+		fmt.Printf("[%p] %d\n", c, *c)
+	}
+}
+
+func main() {
+	a := &MyStruct{i: 40, j: 50}
+	myFunction(a)
+	fmt.Printf("[%p] %v\n", a, a)
+}
+
+$ go run main.go
+[0xc000018180] 41
+[0xc000018188] 52
+[0xc000018180] &{41 52}
+```
+
+在这段代码中，通过指针修改结构体中的成员变量，结构体在内存中是一片连续的空间，指向结构体的指针也是指向这个结构体的首地址。
+
+将 `MyStruct` 指针修改成 `int` 类型的，那么访问新指针就会返回整型变量 `i`，将指针移动 8 个字节之后就能获取下一个成员变量 `j`。
+
+如果将上述代码简化成如下所示的代码片段并使用 `go tool compile` 进行编译会得到如下的结果：
+
+```go
+type MyStruct struct {
+	i int
+	j int
+}
+
+func myFunction(ms *MyStruct) *MyStruct {
+	return ms
+}
+
+$ go tool compile -S -N -l main.go
+"".myFunction STEXT nosplit size=20 args=0x10 locals=0x0
+	0x0000 00000 (main.go:8)	MOVQ	$0, "".~r1+16(SP) // 初始化返回值
+	0x0009 00009 (main.go:9)	MOVQ	"".ms+8(SP), AX   // 复制引用
+	0x000e 00014 (main.go:9)	MOVQ	AX, "".~r1+16(SP) // 返回引用
+	0x0013 00019 (main.go:9)	RET
+```
+
+在这段汇编语言中，发现当参数是指针时，也会使用 `MOVQ "".ms+8(SP), AX` 指令复制引用，然后将复制后的指针作为返回值传递回调用方。
+
+![golang-pointer-as-argument](go_function.assets/2019-01-21-golang-pointer-as-argument.png)
+
+**Go 语言指针参数**
+
+所以将指针作为参数传入某个函数时，函数内部会复制指针，也就是会同时出现两个指针指向原有的内存空间，所以 Go 语言中传指针也是传值。
+
+
+
+#### 传值
+
+当验证了 Go 语言中大多数常见的数据结构之后，其实能够推测出 **Go 语言在传递参数时使用了传值的方式**，接收方收到参数时会对这些参数进行复制。
+
+了解到这一点之后，在传递数组或者内存占用非常大的结构体时，应该尽量使**用指针作为参数类型来避免发生数据拷贝进而影响性能**。
 
 
 
