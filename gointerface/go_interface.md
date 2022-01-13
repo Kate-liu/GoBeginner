@@ -587,12 +587,12 @@ error occur: <nil>
 
 ```go
 // runtime/runtime2.go
-type iface struct {
+type iface struct { // 16 字节
    tab  *itab
    data unsafe.Pointer
 }
 
-type eface struct {
+type eface struct { // 16 字节
    _type *_type
    data  unsafe.Pointer
 }
@@ -631,6 +631,14 @@ type _type struct {
 }
 ```
 
+`runtime._type` 是 Go 语言类型的运行时表示。其中包含了很多类型的元信息，例如：类型的大小、哈希、对齐以及种类等。
+
+- `size` 字段存储了类型占用的内存空间，为内存空间的分配提供信息；
+- `hash` 字段能够帮助我们快速确定类型是否相等；
+- `equal` 字段用于判断当前类型的多个对象是否相等，该字段是为了减少 Go 语言二进制包大小从 `typeAlg` 结构体中迁移过来的；
+
+
+
 ### iface
 
 而 iface 除了要存储动态类型信息之外，还要存储接口本身的信息（接口的类型信息、方法列表信息等）以及动态类型所实现的方法的信息，因此 iface 的第一个字段指向一个 itab类型结构。
@@ -639,7 +647,7 @@ itab 结构的定义如下：
 
 ```go
 // runtime/runtime2.go
-type itab struct {
+type itab struct { // 32 字节
    inter *interfacetype
    _type *_type
    hash  uint32 // copy of _type.hash. Used for type switches.
@@ -649,6 +657,11 @@ type itab struct {
 ```
 
 这里也可以看到，itab 结构中的第一个字段inter指向的 interfacetype 结构，存储着这个接口类型自身的信息。
+
+`runtime.itab` 结构体是接口类型的核心组成部分，每一个 `runtime.itab` 都占 32 字节，可以将其看成接口类型和具体类型的组合，除了 `inter` 和 `_type` 两个用于表示类型的字段之外，上述结构体中的另外两个字段也有自己的作用：
+
+- `hash` 是对 `_type.hash` 的拷贝，将 `interface` 类型转换成具体类型时，可以使用该字段快速判断目标类型和具体类型 `runtime._type` 是否一致；
+- `fun` 是一个动态大小的数组，它是一个用于动态派发的虚函数表，存储了一组函数指针。虽然该变量被声明成大小固定的数组，但是在使用时会通过原始指针获取其中的数据，所以 `fun` 数组中保存的元素数量是不确定的；
 
 看一下下面这段代码表示的 interfacetype 类型定义， 这 个 interfacetype 结构由类型信息（typ）、包路径名（pkgpath）和接口方法集合切片 （mhdr）组成。
 
