@@ -151,6 +151,48 @@ $go tool compile -S -N -l main.go
 
 
 
+### 禁止方法的内联编译
+
+> 更多的 Go’s hidden #pragmas 方法，参见：https://dave.cheney.net/2018/01/08/gos-hidden-pragmas
+
+使用 `//go:noinline` 指令禁止 `Quack` 方法的内联编译：
+
+```go
+//go:noinline
+func (c *Cat) Quack() {
+   println(c.Name + " meow")
+}
+```
+
+
+
+### Go 基准测试
+
+直接运行下面的命令，使用 1 个 CPU 运行上述代码，每一个基准测试都会被执行 3 次：
+
+```sh
+$go test -gcflags=-N -benchmem -test.count=3 -test.cpu=1 -test.benchtime=1s -bench=. 
+goos: darwin
+goarch: amd64
+pkg: github.com/Kate-liu/GoBeginner/gointerface/interfacedefinitionsource
+cpu: Intel(R) Core(TM) i5-8257U CPU @ 1.40GHz
+BenchmarkDirectCall             549406407                2.208 ns/op           0 B/op          0 allocs/op
+BenchmarkDirectCall             537321348                2.282 ns/op           0 B/op          0 allocs/op
+BenchmarkDirectCall             528971692                2.211 ns/op           0 B/op          0 allocs/op
+BenchmarkDynamicDispatch        377805552                3.111 ns/op           0 B/op          0 allocs/op
+BenchmarkDynamicDispatch        381209865                3.300 ns/op           0 B/op          0 allocs/op
+BenchmarkDynamicDispatch        382839784                3.163 ns/op           0 B/op          0 allocs/op
+PASS
+ok      github.com/Kate-liu/GoBeginner/gointerface/interfacedefinitionsource    8.897s
+
+```
+
+
+
+
+
+
+
 ## C 命令行工具
 
 ### C 代码转换为汇编代码
@@ -240,6 +282,16 @@ $ GOARCH=wasm GOOS=js go1.17 build -o lib.wasm main.go
 可以使用上述的命令将 Go 的源代码编译成能够在浏览器上运行 WebAssembly 文件，当然除了这种新兴的二进制指令格式之外，Go 语言经过编译还可以运行在几乎全部的主流机器上，不过它的兼容性在除 Linux 和 Darwin 之外的机器上可能还有一些问题，例如：Go Plugin 至今仍然不支持 [Windows](https://github.com/golang/go/issues/19282)。
 
 
+
+### What is POSIX?
+
+>link：http://www.robelle.com/smugbook/posix.html
+
+可移植操作系统接口（Portable Operating System Interface，POSIX)，它定义了应用程序接口和命令行等标准，为计算机软件带来了可移植性 — 只要操作系统实现了 POSIX，计算机软件就可以直接在不同操作系统上运行。
+
+*POSIX* stands for Portable Operating System Interface, and is an IEEE standard designed to facilitate application portability. POSIX is an attempt by a consortium of vendors to create a single standard version of [UNIX](http://www.robelle.com/smugbook/unix.html). If they are successful, it will make it easier to port applications between hardware platforms. Hewlett-Packard is incorporating POSIX into version 5.0 of its [MPE/iX](http://www.robelle.com/smugbook/mpe.html) proprietary operating system and into version 10.0 of HP/UX (its UNIX).
+
+There are more than ten parts to the POSIX standard, but two are widely available. POSIX.1 defines C programming interfaces (that is, a library of system calls) for files, processes, and terminal I/O. To support the library, a POSIX system must implement a [Hierarchical File System (HFS)](http://www.robelle.com/smugbook/hfs.html). POSIX.2 defines a "shell" command interpreter and utilities (e.g., [ls to list files).](http://www.robelle.com/smugbook/lscmd.html) Certain important standards are not covered by POSIX (for example, spooling, batch processing, and NLS -- Native Language Support). NLS is defined by the X/Open standard.
 
 
 
