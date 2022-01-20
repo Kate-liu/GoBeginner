@@ -1316,13 +1316,458 @@ Goroutine 的唤醒顺序也是按照**加入队列的先后顺序**，先加入
 
 
 
+## 扩展原语
+
+除了标准库中提供的同步原语之外，Go 语言还在子仓库 [sync](https://github.com/golang/sync) 中提供了四种扩展原语，`golang/sync/errgroup.Group`、`golang/sync/semaphore.Weighted`、`golang/sync/singleflight.Group` 和 `golang/sync/syncmap.Map`，其中的 `golang/sync/syncmap.Map` 在 1.9 版本中被移植到了标准库中。
+
+![golang-extension-sync-primitives](go_concurrent.assets/2020-01-23-15797104328056-golang-extension-sync-primitives.png)
+
+**Go 扩展原语**
+
+介绍 Go 语言在扩展包中提供的三种同步原语，也就是 `golang/sync/errgroup.Group`、`golang/sync/semaphore.Weighted` 和 `golang/sync/singleflight.Group`。
+
+### ErrGroup
+
+`golang/sync/errgroup.Group` 在一组 Goroutine 中提供了同步、错误传播以及上下文取消的功能，可以使用如下所示的方式**并行获取网页的数据**：
+
+```go
+var g errgroup.Group
+var urls = []string{
+    "http://www.golang.org/",
+    "http://www.google.com/",
+}
+for i := range urls {
+    url := urls[i]
+    g.Go(func() error {
+        resp, err := http.Get(url)
+        if err == nil {
+            resp.Body.Close()
+        }
+        return err
+    })
+}
+if err := g.Wait(); err == nil {
+    fmt.Println("Successfully fetched all URLs.")
+}
+```
+
+`golang/sync/errgroup.Group.Go` 方法能够创建一个 Goroutine 并在其中执行传入的函数，而 `golang/sync/errgroup.Group.Wait` 会等待所有 Goroutine 全部返回，该方法的不同返回结果也有不同的含义：
+
+- 如果返回错误 — 这一组 Goroutine 最少返回一个错误；
+- 如果返回空值 — 所有 Goroutine 都成功执行；
+
+#### 结构体
+
+`golang/sync/errgroup.Group` 结构体同时由三个比较重要的部分组成：
+
+1. `cancel` — 创建 `context.Context` 时返回的取消函数，用于在多个 Goroutine 之间同步取消信号；
+2. `wg` — 用于等待一组 Goroutine 完成子任务的同步原语；
+3. `errOnce` — 用于保证只接收一个子任务返回的错误；
+
+```go
+// github.com/golang/sync/errgroup/errgroup.go
+type Group struct {
+	cancel func()
+
+	wg sync.WaitGroup
+
+	errOnce sync.Once
+	err     error
+}
+```
+
+这些字段共同组成了 `golang/sync/errgroup.Group` 结构体并提供同步、错误传播以及上下文取消等功能。
+
+#### 接口
+
+通过 `golang/sync/errgroup.WithContext` 构造器创建新的 `golang/sync/errgroup.Group` 结构体：
+
+```go
+// github.com/golang/sync/errgroup/errgroup.go
+func WithContext(ctx context.Context) (*Group, context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	return &Group{cancel: cancel}, ctx
+}
+```
+
+运行新的并行子任务需要使用 `golang/sync/errgroup.Group.Go` 方法，这个方法的执行过程如下：
+
+1. 调用 `sync.WaitGroup.Add` 增加待处理的任务；
+2. 创建新的 Goroutine 并运行子任务；
+3. 返回错误时及时调用 `cancel` 并对 `err` 赋值，只有最早返回的错误才会被上游感知到，后续的错误都会被舍弃：
+
+```go
+// github.com/golang/sync/errgroup/errgroup.go
+func (g *Group) Go(f func() error) {
+	g.wg.Add(1)
+
+	go func() {
+		defer g.wg.Done()
+
+		if err := f(); err != nil {
+			g.errOnce.Do(func() {
+				g.err = err
+				if g.cancel != nil {
+					g.cancel()
+				}
+			})
+		}
+	}()
+}
+
+func (g *Group) Wait() error {
+	g.wg.Wait()
+	if g.cancel != nil {
+		g.cancel()
+	}
+	return g.err
+}
+```
+
+另一个用于等待的 `golang/sync/errgroup.Group.Wait` 方法只是调用了 `sync.WaitGroup.Wait`，在子任务全部完成时取消 `context.Context` 并返回可能出现的错误。
+
+#### 小结
+
+`golang/sync/errgroup.Group` 的实现没有涉及底层和运行时包中的 API，它只是对基本同步语义进行了封装以提供更加复杂的功能。在使用时也需要注意下面几个问题：
+
+- `golang/sync/errgroup.Group` 在出现错误或者等待结束后会调用 `context.Context` 的 `cancel` 方法同步取消信号；
+- 只有第一个出现的错误才会被返回，剩余的错误会被直接丢弃；
 
 
 
+### Semaphore
+
+信号量是在并发编程中常见的一种同步机制，在需要**控制访问资源的进程数量时就会用到信号量**，它会保证持有的计数器在 0 到初始化的权重之间波动。
+
+- 每次获取资源时都会将信号量中的计数器减去对应的数值，在释放时重新加回来；
+- 当遇到计数器大于信号量大小时，会进入休眠等待其他线程释放信号；
+
+Go 语言的扩展包中就提供了**带权重的信号量** `golang/sync/semaphore.Weighted`，可以按照不同的权重对资源的访问进行管理，这个结构体对外也只暴露了四个方法：
+
+- `golang/sync/semaphore.NewWeighted` 用于创建新的信号量；
+- `golang/sync/semaphore.Weighted.Acquire` 阻塞地获取指定权重的资源，如果当前没有空闲资源，会陷入休眠等待；
+- `golang/sync/semaphore.Weighted.TryAcquire` 非阻塞地获取指定权重的资源，如果当前没有空闲资源，会直接返回 `false`；
+- `golang/sync/semaphore.Weighted.Release` 用于释放指定权重的资源；
+
+#### 结构体
+
+`golang/sync/semaphore.NewWeighted` 方法能根据传入的最大权重创建一个指向 `golang/sync/semaphore.Weighted` 结构体的指针：
+
+```go
+// github.com/golang/sync/semaphore/semaphore.go
+func NewWeighted(n int64) *Weighted {
+	w := &Weighted{size: n}
+	return w
+}
+
+type Weighted struct {
+	size    int64  // 上限
+	cur     int64  // 计数器
+	mu      sync.Mutex
+	waiters list.List
+}
+```
+
+`golang/sync/semaphore.Weighted` 结构体中包含一个 `waiters` 列表，其中存储着等待获取资源的 Goroutine，除此之外它还包含当前信号量的上限`size`以及一个计数器 `cur`，这个计数器的范围就是 [0, size]：
+
+![golang-semaphore](go_concurrent.assets/2020-01-23-15797104328063-golang-semaphore.png)
+
+**权重信号量**
+
+信号量中的计数器会随着用户对资源的访问和释放进行改变，引入的权重概念能够提供更细粒度的资源的访问控制，尽可能满足常见的用例。
+
+#### 获取
+
+`golang/sync/semaphore.Weighted.Acquire` 方法能用于获取指定权重的资源，其中包含三种不同情况：
+
+1. 当信号量中剩余的资源大于获取的资源并且没有等待的 Goroutine 时，会直接获取信号量；
+2. 当需要获取的信号量大于 `golang/sync/semaphore.Weighted` 的上限时，由于不可能满足条件会直接返回错误；
+3. 遇到其他情况时会将当前 Goroutine 加入到等待列表并通过 `select` 等待调度器唤醒当前 Goroutine，Goroutine 被唤醒后会获取信号量；
+
+```go
+// github.com/golang/sync/semaphore/semaphore.go
+func (s *Weighted) Acquire(ctx context.Context, n int64) error {
+
+  // 第一种情况
+  if s.size-s.cur >= n && s.waiters.Len() == 0 {
+		s.cur += n
+		return nil
+	}
+
+  // 第二种情况
+	if n > s.size {
+		// Don't make other Acquire calls block on one that's doomed to fail.
+		s.mu.Unlock()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+  
+  // 其他情况
+	ready := make(chan struct{})
+	w := waiter{n: n, ready: ready}
+	elem := s.waiters.PushBack(w)
+	select {
+	case <-ctx.Done():
+		err := ctx.Err()
+		select {
+		case <-ready:
+			err = nil
+		default:
+			s.waiters.Remove(elem)
+		}
+		return err
+	case <-ready:
+		return nil
+	}
+}
+```
+
+另一个用于获取信号量的方法 `golang/sync/semaphore.Weighted.TryAcquire` 只会非阻塞地判断当前信号量是否有充足的资源，如果有充足的资源会直接立刻返回 `true`，否则会返回 `false`：
+
+```go
+// github.com/golang/sync/semaphore/semaphore.go
+func (s *Weighted) TryAcquire(n int64) bool {
+	s.mu.Lock()
+	success := s.size-s.cur >= n && s.waiters.Len() == 0
+	if success {
+		s.cur += n
+	}
+	s.mu.Unlock()
+	return success
+}
+```
+
+因为 `golang/sync/semaphore.Weighted.TryAcquire` 不会等待资源的释放，所以可能更适用于一些延时敏感、用户需要立刻感知结果的场景。
+
+#### 释放
+
+当要释放信号量时，`golang/sync/semaphore.Weighted.Release` 方法会从头到尾遍历 `waiters` 列表中全部的等待者，如果释放资源后的信号量有充足的剩余资源就会通过 Channel 唤起指定的 Goroutine：
+
+```go
+// github.com/golang/sync/semaphore/semaphore.go
+func (s *Weighted) Release(n int64) {
+	s.mu.Lock()
+	s.cur -= n
+	for {
+		next := s.waiters.Front()
+		if next == nil {
+			break
+		}
+		w := next.Value.(waiter)
+		if s.size-s.cur < w.n {
+			break
+		}
+		s.cur += w.n
+		s.waiters.Remove(next)
+		close(w.ready)
+	}
+	s.mu.Unlock()
+}
+```
+
+当然也可能会出现剩余资源无法唤起 Goroutine 的情况，在这时当前方法在释放锁后会直接返回。
+
+通过对 `golang/sync/semaphore.Weighted.Release` 的分析能发现，如果一个信号量需要的占用的资源非常多，它可能会**长时间无法获取锁**，这也是 `golang/sync/semaphore.Weighted.Acquire` 引入上下文参数的原因，即为信号量的获取设置超时时间。
+
+#### 小结
+
+带权重的信号量确实有着更多的应用场景，这也是 Go 语言对外提供的唯一一种信号量实现，在使用的过程中需要注意以下的几个问题：
+
+- `golang/sync/semaphore.Weighted.Acquire` 和 `golang/sync/semaphore.Weighted.TryAcquire` 都可以用于获取资源，前者会阻塞地获取信号量，后者会非阻塞地获取信号量；
+- `golang/sync/semaphore.Weighted.Release` 方法会按照先进先出的顺序唤醒可以被唤醒的 Goroutine；
+- 如果一个 Goroutine 获取了较多地资源，由于 `golang/sync/semaphore.Weighted.Release` 的释放策略可能会等待比较长的时间；
 
 
 
+### SingleFlight
 
+`golang/sync/singleflight.Group` 是 Go 语言扩展包中提供了另一种同步原语，它能够**在一个服务中抑制对下游的多次重复请求**。
+
+一个比较常见的使用场景是：在使用 Redis 对数据库中的数据进行缓存，发生**缓存击穿**时，大量的流量都会打到数据库上进而影响服务的尾延时。
+
+![golang-query-without-single-flight](go_concurrent.assets/2020-01-23-15797104328070-golang-query-without-single-flight.png)
+
+**Redis 缓存击穿问题**
+
+但是 `golang/sync/singleflight.Group` 能有效地解决这个问题，它能够限制对同一个键值对的多次重复请求，减少对下游的瞬时流量。
+
+![golang-extension-single-flight](go_concurrent.assets/2020-01-23-15797104328078-golang-extension-single-flight.png)
+
+**缓解缓存击穿问题**
+
+在资源的获取非常昂贵时（例如：访问缓存、数据库），就很适合使用 `golang/sync/singleflight.Group` 优化服务。来了解一下它的使用方法：
+
+```go
+type service struct {
+    requestGroup singleflight.Group
+}
+
+func (s *service) handleRequest(ctx context.Context, request Request) (Response, error) {
+    v, err, _ := requestGroup.Do(request.Hash(), func() (interface{}, error) {
+        rows, err := // select * from tables
+        if err != nil {
+            return nil, err
+        }
+        return rows, nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    return Response{
+        rows: rows,
+    }, nil
+}
+```
+
+因为请求的哈希在业务上一般表示相同的请求，所以上述代码使用它作为请求的键。当然，也可以选择其他的字段作为 `golang/sync/singleflight.Group.Do` 方法的第一个参数减少重复的请求。
+
+#### 结构体
+
+`golang/sync/singleflight.Group` 结构体由一个互斥锁 `sync.Mutex` 和一个映射表组成，每一个 `golang/sync/singleflight.call` 结构体都保存了当前调用对应的信息：
+
+```go
+// github.com/golang/sync/singleflight/singleflight.go
+type Group struct {
+	mu sync.Mutex       // protects m
+	m  map[string]*call // lazily initialized
+}
+
+type call struct {
+	wg sync.WaitGroup
+
+	val interface{}
+	err error
+
+	dups  int
+	chans []chan<- Result
+}
+```
+
+`golang/sync/singleflight.call` 结构体中的 `val` 和 `err` 字段都只会在执行传入的函数时，赋值一次并在 `sync.WaitGroup.Wait` 返回时被读取；`dups` 和 `chans` 两个字段分别存储了抑制的请求数量以及用于同步结果的 Channel。
+
+#### 接口
+
+`golang/sync/singleflight.Group` 提供了两个用于抑制相同请求的方法：
+
+- `golang/sync/singleflight.Group.Do` — 同步等待的方法；
+- `golang/sync/singleflight.Group.DoChan` — 返回 Channel 异步等待的方法；
+
+这两个方法在功能上没有太多的区别，只是在接口的表现上稍有不同。
+
+每次调用 `golang/sync/singleflight.Group.Do` 方法时都会获取互斥锁，随后判断是否已经存在键对应的 `golang/sync/singleflight.call`：
+
+1. 当不存在对应的`golang/sync/singleflight.call` 时：
+
+   1. 初始化一个新的 `golang/sync/singleflight.call` 指针；
+   2. 增加 `sync.WaitGroup` 持有的计数器；
+
+   3. 将 `golang/sync/singleflight.call` 指针添加到映射表；
+   4. 释放持有的互斥锁；
+   5. 阻塞地调用 `golang/sync/singleflight.Group.doCall` 方法等待结果的返回；
+
+2. 当存在对应的`golang/sync/singleflight.call` 时；
+
+   1. 增加 `dups` 计数器，它表示当前重复的调用次数；
+   2. 释放持有的互斥锁；
+   3. 通过 `sync.WaitGroup.Wait` 等待请求的返回；
+
+```go
+// github.com/golang/sync/singleflight/singleflight.go
+func (g *Group) Do(key string, fn func() (interface{}, error)) (v interface{}, err error, shared bool) {
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[string]*call)
+	}
+	if c, ok := g.m[key]; ok {
+		c.dups++
+		g.mu.Unlock()
+		c.wg.Wait()
+		return c.val, c.err, true
+	}
+	c := new(call)
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	g.doCall(c, key, fn)
+	return c.val, c.err, c.dups > 0
+}
+```
+
+因为 `val` 和 `err` 两个字段都只会在 `golang/sync/singleflight.Group.doCall` 方法中赋值，所以当 `golang/sync/singleflight.Group.doCall` 和 `sync.WaitGroup.Wait` 返回时，函数调用的结果和错误都会返回给 `golang/sync/singleflight.Group.Do` 的调用者。
+
+```go
+// github.com/golang/sync/singleflight/singleflight.go
+func (g *Group) doCall(c *call, key string, fn func() (interface{}, error)) {
+	c.val, c.err = fn()
+	c.wg.Done()
+
+	g.mu.Lock()
+	delete(g.m, key)
+	for _, ch := range c.chans {
+		ch <- Result{c.val, c.err, c.dups > 0}
+	}
+	g.mu.Unlock()
+}
+```
+
+1. 运行传入的函数 `fn`，该函数的返回值会赋值给 `c.val` 和 `c.err`；
+2. 调用 `sync.WaitGroup.Done` 方法通知所有等待结果的 Goroutine — 当前函数已经执行完成，可以从 `call` 结构体中取出返回值并返回了；
+3. 获取持有的互斥锁并通过管道将信息同步给使用 `golang/sync/singleflight.Group.DoChan` 方法的 Goroutine；
+
+```go
+func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result {
+	ch := make(chan Result, 1)
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[string]*call)
+	}
+	if c, ok := g.m[key]; ok {
+		c.dups++
+		c.chans = append(c.chans, ch)
+		g.mu.Unlock()
+		return ch
+	}
+	c := &call{chans: []chan<- Result{ch}}
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	go g.doCall(c, key, fn)
+
+	return ch
+}
+```
+
+`golang/sync/singleflight.Group.Do` 和 `golang/sync/singleflight.Group.DoChan` 分别提供了同步和异步的调用方式，这让使用起来也更加灵活。
+
+#### 小结
+
+当需要减少对下游的相同请求时，可以使用 `golang/sync/singleflight.Group` 来增加吞吐量和服务质量，不过在使用的过程中也需要注意以下的几个问题：
+
+- `golang/sync/singleflight.Group.Do` 和 `golang/sync/singleflight.Group.DoChan` 一个用于同步阻塞调用传入的函数，一个用于异步调用传入的参数并通过 Channel 接收函数的返回值；
+- `golang/sync/singleflight.Group.Forget` 可以通知 `golang/sync/singleflight.Group` 在持有的映射表中删除某个键，接下来对该键的调用就不会等待前面的函数返回了；
+- 一旦调用的函数返回了错误，所有在等待的 Goroutine 也都会接收到同样的错误；
+
+## 小结
+
+介绍了 Go 语言标准库中提供的基本原语以及扩展包中的扩展原语，这些并发编程的原语能够更好地利用 Go 语言的特性构建高吞吐量、低延时的服务、解决并发带来的问题。
+
+在设计同步原语时，不仅要考虑 API 接口的易用、解决并发编程中可能遇到的线程竞争问题，还需要对尾延时进行优化，保证公平性，理解同步原语也是理解并发编程无法跨越的一个步骤。
+
+## 参考
+
+- “sync: allow inlining the Mutex.Lock fast path” https://github.com/golang/go/commit/41cb0aedffdf4c5087de82710c4d016a3634b4ac
+- “sync: allow inlining the Mutex.Unlock fast path” https://github.com/golang/go/commit/4c3f26076b6a9853bcc3c7d7e43726c044ac028a#diff-daec021895d1400f2c064a3e851c0d2c
+- “runtime: fall back to fair locks after repeated sleep-acquire failures” https://github.com/golang/go/issues/13086
+- Go Team. May 2014. “The Go Memory Model” https://golang.org/ref/mem
+- Chris. May 2017. “The X-Files: Exploring the Golang Standard Library Sub-Repositories” https://rodaine.com/2017/05/x-files-intro/
+- Dmitry Vyukov, Russ Cox. Dec 13, 2016. “sync: make Mutex more fair” https://github.com/golang/go/commit/0556e26273f704db73df9e7c4c3d2e8434dec7be 
+- golang/sync/syncmap: recommend sync.Map #33867 https://github.com/golang/go/issues/33867 
+
+
+
+## 计时器
 
 
 
