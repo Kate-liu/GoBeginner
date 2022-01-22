@@ -3644,9 +3644,795 @@ type p struct {
 
 ### 调度器启动
 
+调度器的启动过程是平时比较难以接触的过程，不过作为程序启动前的准备工作，理解调度器的启动过程对理解调度器的实现原理很有帮助，运行时通过 `runtime.schedinit`初始化调度器：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func schedinit() {
+	_g_ := getg()
+	...
+
+	sched.maxmcount = 10000
+
+	...
+	sched.lastpoll = uint64(nanotime())
+	procs := ncpu
+	if n, ok := atoi32(gogetenv("GOMAXPROCS")); ok && n > 0 {
+		procs = n
+	}
+	if procresize(procs) != nil {
+		throw("unknown runnable goroutine during bootstrap")
+	}
+}
+```
+
+在调度器初始函数执行的过程中会将 `maxmcount` 设置成 10000，这也就是一个 Go 语言程序能够创建的最大线程数，虽然最多可以创建 10000 个线程，但是可以同时运行的线程还是由 `GOMAXPROCS` 变量控制。
+
+从环境变量 `GOMAXPROCS` 获取了程序能够同时运行的最大处理器数之后就会调用 [`runtime.procresize`](https://draveness.me/golang/tree/runtime.procresize) 更新程序中处理器的数量，在这时整个程序不会执行任何用户 Goroutine，调度器也会进入锁定状态，[`runtime.procresize`](https://draveness.me/golang/tree/runtime.procresize) 的执行过程如下：
+
+1. 如果全局变量 `allp` 切片中的处理器数量少于期望数量，会对切片进行扩容；
+2. 使用 `new` 创建新的处理器结构体并调用 [`runtime.p.init`](https://draveness.me/golang/tree/runtime.p.init) 初始化刚刚扩容的处理器；
+3. 通过指针将线程 m0 和处理器 `allp[0]` 绑定到一起；
+4. 调用 [`runtime.p.destroy`](https://draveness.me/golang/tree/runtime.p.destroy) 释放不再使用的处理器结构；
+5. 通过截断改变全局变量 `allp` 的长度保证与期望处理器数量相等；
+6. 将除 `allp[0]` 之外的处理器 P 全部设置成 `_Pidle` 并加入到全局的空闲队列中；
+
+调用 [`runtime.procresize`](https://draveness.me/golang/tree/runtime.procresize) 是调度器启动的最后一步，在这一步过后调度器会完成相应数量处理器的启动，等待用户创建运行新的 Goroutine 并为 Goroutine 调度处理器资源。
+
+### 创建 Goroutine
+
+想要启动一个新的 Goroutine 来执行任务时，需要使用 Go 语言的 `go` 关键字，编译器会通过 [`cmd/compile/internal/gc.state.stmt`](https://draveness.me/golang/tree/cmd/compile/internal/gc.state.stmt) 和 [`cmd/compile/internal/gc.state.call`](https://draveness.me/golang/tree/cmd/compile/internal/gc.state.call) 两个方法将该关键字转换成 [`runtime.newproc`](https://draveness.me/golang/tree/runtime.newproc) 函数调用：
+
+```go
+// github.com/golang/go/src/cmd/compile/internal/gc/ssa.go
+func (s *state) call(n *Node, k callKind) *ssa.Value {
+	if k == callDeferStack {
+		...
+	} else {
+		switch {
+		case k == callGo:
+			call = s.newValue1A(ssa.OpStaticCall, types.TypeMem, newproc, s.mem())
+		default:
+		}
+	}
+	...
+}
+```
+
+[`runtime.newproc`](https://draveness.me/golang/tree/runtime.newproc) 的入参是参数大小和表示函数的指针 `funcval`，它会获取 Goroutine 以及调用方的程序计数器，然后调用 [`runtime.newproc1`](https://draveness.me/golang/tree/runtime.newproc1) 函数获取新的 Goroutine 结构体、将其加入处理器的运行队列并在满足条件时调用 [`runtime.wakep`](https://draveness.me/golang/tree/runtime.wakep) 唤醒新的处理执行 Goroutine：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func newproc(siz int32, fn *funcval) {
+	argp := add(unsafe.Pointer(&fn), sys.PtrSize)
+	gp := getg()
+	pc := getcallerpc()
+	systemstack(func() {
+		newg := newproc1(fn, argp, siz, gp, pc)
+
+		_p_ := getg().m.p.ptr()
+		runqput(_p_, newg, true)
+
+		if mainStarted {
+			wakep()
+		}
+	})
+}
+```
+
+[`runtime.newproc1`](https://draveness.me/golang/tree/runtime.newproc1) 会根据传入参数初始化一个 `g` 结构体，可以将该函数分成以下几个部分介绍它的实现：
+
+1. **获取或者创建新的 Goroutine 结构体**；
+2. **将传入的参数移到 Goroutine 的栈上**；
+3. **更新 Goroutine 调度相关的属性**；
+
+首先是 Goroutine 结构体的创建过程：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerpc uintptr) *g {
+	_g_ := getg()
+	siz := narg
+	siz = (siz + 7) &^ 7
+
+	_p_ := _g_.m.p.ptr()
+	newg := gfget(_p_)  // 查找空闲 goroutine
+	if newg == nil {
+		newg = malg(_StackMin)  // 创建新的
+		casgstatus(newg, _Gidle, _Gdead)
+		allgadd(newg)
+	}
+	...
+```
+
+上述代码会先从处理器的 `gFree` 列表中查找空闲的 Goroutine，如果不存在空闲的 Goroutine，会通过 [`runtime.malg`](https://draveness.me/golang/tree/runtime.malg) 创建一个栈大小足够的新结构体。
+
+接下来，会调用 [`runtime.memmove`](https://draveness.me/golang/tree/runtime.memmove) 将 `fn` 函数的所有参数拷贝到栈上，`argp` 和 `narg` 分别是参数的内存空间和大小，在该方法中会将参数对应的内存空间整块拷贝到栈上：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+	...
+	totalSize := 4*sys.RegSize + uintptr(siz) + sys.MinFrameSize
+	totalSize += -totalSize & (sys.SpAlign - 1)
+	sp := newg.stack.hi - totalSize
+	spArg := sp
+	if narg > 0 {
+		memmove(unsafe.Pointer(spArg), argp, uintptr(narg))
+	}
+	...
+```
+
+拷贝了栈上的参数之后，[`runtime.newproc1`](https://draveness.me/golang/tree/runtime.newproc1) 会设置新的 Goroutine 结构体的参数，包括栈指针、程序计数器并更新其状态到 `_Grunnable` 并返回：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+  ...
+	memclrNoHeapPointers(unsafe.Pointer(&newg.sched), unsafe.Sizeof(newg.sched))
+	newg.sched.sp = sp
+	newg.stktopsp = sp
+	newg.sched.pc = funcPC(goexit) + sys.PCQuantum
+	newg.sched.g = guintptr(unsafe.Pointer(newg))
+	gostartcallfn(&newg.sched, fn)
+	newg.gopc = callerpc
+	newg.startpc = fn.fn
+	casgstatus(newg, _Gdead, _Grunnable)
+	newg.goid = int64(_p_.goidcache)
+	_p_.goidcache++
+	return newg
+}
+```
+
+在分析 [`runtime.newproc`](https://draveness.me/golang/tree/runtime.newproc) 的过程中，保留了主干省略了用于获取结构体的 [`runtime.gfget`](https://draveness.me/golang/tree/runtime.gfget)、[`runtime.malg`](https://draveness.me/golang/tree/runtime.malg)、将 Goroutine 加入运行队列的 [`runtime.runqput`](https://draveness.me/golang/tree/runtime.runqput) 以及设置调度信息的过程，下面会依次分析这些函数。
+
+#### 初始化结构体
+
+[`runtime.gfget`](https://draveness.me/golang/tree/runtime.gfget) 通过两种不同的方式获取新的 [`runtime.g`](https://draveness.me/golang/tree/runtime.g)：
+
+1. 从 Goroutine 所在处理器的 `gFree` 列表或者调度器的 `sched.gFree` 列表中获取 [`runtime.g`](https://draveness.me/golang/tree/runtime.g)；
+2. 调用 [`runtime.malg`](https://draveness.me/golang/tree/runtime.malg) 生成一个新的 [`runtime.g`](https://draveness.me/golang/tree/runtime.g) 并将结构体追加到全局的 Goroutine 列表 `allgs` 中。
+
+![golang-newproc-get-goroutine](go_concurrent.assets/golang-newproc-get-goroutine-2862522.png)
+
+**获取 Goroutine 结构体的三种方法**
+
+[`runtime.gfget`](https://draveness.me/golang/tree/runtime.gfget) 中包含两部分逻辑，它会根据处理器中 `gFree` 列表中 Goroutine 的数量做出不同的决策：
+
+1. 当处理器的 Goroutine 列表为空时，会将调度器持有的空闲 Goroutine 转移到当前处理器上，直到 `gFree` 列表中的 Goroutine 数量达到 32；
+2. 当处理器的 Goroutine 数量充足时，会从列表头部返回一个新的 Goroutine；
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func gfget(_p_ *p) *g {
+retry:
+	if _p_.gFree.empty() && (!sched.gFree.stack.empty() || !sched.gFree.noStack.empty()) {
+		for _p_.gFree.n < 32 {
+			gp := sched.gFree.stack.pop()
+			if gp == nil {
+				gp = sched.gFree.noStack.pop()
+				if gp == nil {
+					break
+				}
+			}
+			_p_.gFree.push(gp)
+		}
+		goto retry
+	}
+	gp := _p_.gFree.pop()
+	if gp == nil {
+		return nil
+	}
+	return gp
+}
+```
+
+当调度器的 `gFree` 和处理器的 `gFree` 列表都不存在结构体时，运行时会调用 [`runtime.malg`](https://draveness.me/golang/tree/runtime.malg) 初始化新的 [`runtime.g`](https://draveness.me/golang/tree/runtime.g) 结构，如果申请的堆栈大小大于 0，这里会通过 [`runtime.stackalloc`](https://draveness.me/golang/tree/runtime.stackalloc) 分配 2KB 的栈空间：
+
+```go
+func malg(stacksize int32) *g {
+	newg := new(g)
+	if stacksize >= 0 {
+		stacksize = round2(_StackSystem + stacksize)
+		newg.stack = stackalloc(uint32(stacksize))
+		newg.stackguard0 = newg.stack.lo + _StackGuard
+		newg.stackguard1 = ^uintptr(0)
+	}
+	return newg
+}
+```
+
+[`runtime.malg`](https://draveness.me/golang/tree/runtime.malg) 返回的 Goroutine 会存储到全局变量 `allgs` 中。
+
+简单总结一下，[`runtime.newproc1`](https://draveness.me/golang/tree/runtime.newproc1) 会从处理器或者调度器的缓存中获取新的结构体，也可以调用 [`runtime.malg`](https://draveness.me/golang/tree/runtime.malg) 函数创建。
+
+#### 运行队列
+
+[`runtime.runqput`](https://draveness.me/golang/tree/runtime.runqput) 会将 Goroutine 放到运行队列上，这既可能是全局的运行队列，也可能是处理器本地的运行队列：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func runqput(_p_ *p, gp *g, next bool) {
+	if next {
+	retryNext:
+		oldnext := _p_.runnext
+		if !_p_.runnext.cas(oldnext, guintptr(unsafe.Pointer(gp))) {
+			goto retryNext
+		}
+		if oldnext == 0 {
+			return
+		}
+		gp = oldnext.ptr()
+	}
+retry:
+	h := atomic.LoadAcq(&_p_.runqhead)
+	t := _p_.runqtail
+	if t-h < uint32(len(_p_.runq)) {
+		_p_.runq[t%uint32(len(_p_.runq))].set(gp)
+		atomic.StoreRel(&_p_.runqtail, t+1)
+		return
+	}
+	if runqputslow(_p_, gp, h, t) {
+		return
+	}
+	goto retry
+}
+```
+
+1. 当 `next` 为 `true` 时，将 Goroutine 设置到处理器的 `runnext` 作为下一个处理器执行的任务；
+2. 当 `next` 为 `false` 并且本地运行队列还有剩余空间时，将 Goroutine 加入处理器持有的本地运行队列；
+3. 当处理器的本地运行队列已经没有剩余空间时就会把本地队列中的一部分 Goroutine 和待加入的 Goroutine 通过 [`runtime.runqputslow`](https://draveness.me/golang/tree/runtime.runqputslow) 添加到调度器持有的全局运行队列上；
+
+处理器本地的运行队列是一个使用数组构成的环形链表，它最多可以存储 256 个待执行任务。
+
+![golang-runnable-queue](go_concurrent.assets/2020-02-05-15808864354654-golang-runnable-queue-2862522.png)
+
+**全局和本地运行队列**
+
+简单总结一下，**Go 语言有两个运行队列**，其中一个是处理器本地的运行队列，另一个是调度器持有的全局运行队列，只有在本地运行队列没有剩余空间时才会使用全局队列。
+
+#### 调度信息
+
+运行时创建 Goroutine 时会通过下面的代码设置调度相关的信息，前两行代码会分别将程序计数器和 Goroutine 设置成 [`runtime.goexit`](https://draveness.me/golang/tree/runtime.goexit) 和新创建 Goroutine 运行的函数：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+	...
+	newg.sched.pc = funcPC(goexit) + sys.PCQuantum
+	newg.sched.g = guintptr(unsafe.Pointer(newg))
+	gostartcallfn(&newg.sched, fn)
+	...
+```
+
+上述调度信息 `sched` 不是初始化后的 Goroutine 的最终结果，它还需要经过 [`runtime.gostartcallfn`](https://draveness.me/golang/tree/runtime.gostartcallfn) 和 [`runtime.gostartcall`](https://draveness.me/golang/tree/runtime.gostartcall) 的处理：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func gostartcallfn(gobuf *gobuf, fv *funcval) {
+	gostartcall(gobuf, unsafe.Pointer(fv.fn), unsafe.Pointer(fv))
+}
+
+// github.com/golang/go/src/runtime/stack.go
+func gostartcall(buf *gobuf, fn, ctxt unsafe.Pointer) {
+	sp := buf.sp
+	if sys.RegSize > sys.PtrSize {
+		sp -= sys.PtrSize
+		*(*uintptr)(unsafe.Pointer(sp)) = 0
+	}
+	sp -= sys.PtrSize
+	*(*uintptr)(unsafe.Pointer(sp)) = buf.pc
+	buf.sp = sp
+	buf.pc = uintptr(fn)
+	buf.ctxt = ctxt
+}
+```
+
+调度信息的 `sp` 中存储了 [`runtime.goexit`](https://draveness.me/golang/tree/runtime.goexit) 函数的程序计数器，而 `pc` 中存储了传入函数的程序计数器。因为 `pc` 寄存器的作用就是存储程序接下来运行的位置，所以 `pc` 的使用比较好理解，但是 `sp` 中存储的 [`runtime.goexit`](https://draveness.me/golang/tree/runtime.goexit) 会让人感到困惑，需要配合下面的调度循环来理解它的作用。
+
+### 调度循环
+
+调度器启动之后，Go 语言运行时会调用 [`runtime.mstart`](https://draveness.me/golang/tree/runtime.mstart) 以及 [`runtime.mstart1`](https://draveness.me/golang/tree/runtime.mstart1)，前者会初始化 g0 的 `stackguard0` 和 `stackguard1` 字段，后者会初始化线程并调用 [`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule) 进入调度循环：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func schedule() {
+	_g_ := getg()
+
+top:
+	var gp *g
+	var inheritTime bool
+
+	if gp == nil {
+		if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
+			lock(&sched.lock)
+			gp = globrunqget(_g_.m.p.ptr(), 1)
+			unlock(&sched.lock)
+		}
+	}
+	if gp == nil {
+		gp, inheritTime = runqget(_g_.m.p.ptr())
+	}
+	if gp == nil {
+		gp, inheritTime = findrunnable()
+	}
+
+	execute(gp, inheritTime)
+}
+```
+
+[`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule) 函数会从下面几个地方查找待执行的 Goroutine：
+
+1. 为了保证公平，当全局运行队列中有待执行的 Goroutine 时，通过 `schedtick` 保证有一定几率会从全局的运行队列中查找对应的 Goroutine；
+2. 从处理器本地的运行队列中查找待执行的 Goroutine；
+3. 如果前两种方法都没有找到 Goroutine，会通过 [`runtime.findrunnable`](https://draveness.me/golang/tree/runtime.findrunnable) 进行阻塞地查找 Goroutine；
+
+[`runtime.findrunnable`](https://draveness.me/golang/tree/runtime.findrunnable) 的实现非常复杂，这个 300 多行的函数通过以下的过程获取可运行的 Goroutine：
+
+1. 从本地运行队列、全局运行队列中查找；
+2. 从网络轮询器中查找是否有 Goroutine 等待运行；
+3. 通过 [`runtime.runqsteal`](https://draveness.me/golang/tree/runtime.runqsteal) 尝试从其他随机的处理器中窃取待运行的 Goroutine，该函数还可能窃取处理器的计时器；
+
+因为函数的实现过于复杂，上述的执行过程是经过简化的，总而言之，当前函数一定会返回一个可执行的 Goroutine，如果当前不存在就会阻塞等待。
+
+接下来由 [`runtime.execute`](https://draveness.me/golang/tree/runtime.execute) 执行获取的 Goroutine，做好准备工作后，它会通过 [`runtime.gogo`](https://draveness.me/golang/tree/runtime.gogo) 将 Goroutine 调度到当前线程上。
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func execute(gp *g, inheritTime bool) {
+	_g_ := getg()
+
+	_g_.m.curg = gp
+	gp.m = _g_.m
+	casgstatus(gp, _Grunnable, _Grunning)
+	gp.waitsince = 0
+	gp.preempt = false
+	gp.stackguard0 = gp.stack.lo + _StackGuard
+	if !inheritTime {
+		_g_.m.p.ptr().schedtick++
+	}
+
+	gogo(&gp.sched)
+}
+```
+
+[`runtime.gogo`](https://draveness.me/golang/tree/runtime.gogo) 在不同处理器架构上的实现都不同，但是也都大同小异，下面是该函数在 386 架构上的实现：
+
+```go
+// github.com/golang/go/src/runtime/asm_386.s
+TEXT runtime·gogo(SB), NOSPLIT, $8-4
+	MOVL buf+0(FP), BX     // 获取调度信息
+	MOVL gobuf_g(BX), DX
+	MOVL 0(DX), CX         // 保证 Goroutine 不为空
+	get_tls(CX)
+	MOVL DX, g(CX)
+	MOVL gobuf_sp(BX), SP  // 将 runtime.goexit 函数的 PC 恢复到 SP 中
+	MOVL gobuf_ret(BX), AX
+	MOVL gobuf_ctxt(BX), DX
+	MOVL $0, gobuf_sp(BX)
+	MOVL $0, gobuf_ret(BX)
+	MOVL $0, gobuf_ctxt(BX)
+	MOVL gobuf_pc(BX), BX  // 获取待执行函数的程序计数器
+	JMP  BX                // 开始执行
+```
+
+它从 [`runtime.gobuf`](https://draveness.me/golang/tree/runtime.gobuf) 中取出了 [`runtime.goexit`](https://draveness.me/golang/tree/runtime.goexit) 的程序计数器和待执行函数的程序计数器，其中：
+
+- [`runtime.goexit`](https://draveness.me/golang/tree/runtime.goexit) 的程序计数器被放到了栈 SP 上；
+- 待执行函数的程序计数器被放到了寄存器 BX 上；
+
+在函数调用一节中，曾经介绍过 **Go 语言的调用惯例**，正常的函数调用都会使用 `CALL` 指令，该指令会将调用方的返回地址加入栈寄存器 SP 中，然后跳转到目标函数；当目标函数返回后，会从栈中查找调用的地址并跳转回调用方继续执行剩下的代码。
+
+[`runtime.gogo`](https://draveness.me/golang/tree/runtime.gogo) 就利用了 Go 语言的调用惯例成功模拟这一调用过程，通过以下几个关键指令模拟 `CALL` 的过程：
+
+```go
+// github.com/golang/go/src/runtime/asm_386.s
+	MOVL gobuf_sp(BX), SP  // 将 runtime.goexit 函数的 PC 恢复到 SP 中
+	MOVL gobuf_pc(BX), BX  // 获取待执行函数的程序计数器
+	JMP  BX                // 开始执行
+```
+
+![golang-gogo-stack](go_concurrent.assets/2020-02-05-15808864354661-golang-gogo-stack-2862522.png)
+
+**runtime.gogo 栈内存**
+
+上图展示了调用 `JMP` 指令后的栈中数据，当 Goroutine 中运行的函数返回时，程序会跳转到 [`runtime.goexit`](https://draveness.me/golang/tree/runtime.goexit) 所在位置执行该函数：
+
+```go
+// github.com/golang/go/src/runtime/asm_386.s
+TEXT runtime·goexit(SB),NOSPLIT,$0-0
+	CALL	runtime·goexit1(SB)
+
+// github.com/golang/go/src/runtime/proc.go
+func goexit1() {
+	mcall(goexit0)
+}
+```
+
+经过一系列复杂的函数调用，最终在当前线程的 g0 的栈上调用 [`runtime.goexit0`](https://draveness.me/golang/tree/runtime.goexit0) 函数，该函数会将 Goroutine 转换会 `_Gdead` 状态、清理其中的字段、移除 Goroutine 和线程的关联并调用 [`runtime.gfput`](https://draveness.me/golang/tree/runtime.gfput) 重新加入处理器的 Goroutine 空闲列表 `gFree`：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func goexit0(gp *g) {
+	_g_ := getg()
+
+	casgstatus(gp, _Grunning, _Gdead)
+	gp.m = nil
+	...
+	gp.param = nil
+	gp.labels = nil
+	gp.timer = nil
+
+	dropg()
+	gfput(_g_.m.p.ptr(), gp)
+	schedule()
+}
+```
+
+在最后 [`runtime.goexit0`](https://draveness.me/golang/tree/runtime.goexit0) 会重新调用 [`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule) 触发新一轮的 Goroutine 调度，Go 语言中的运行时调度循环会从 [`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule) 开始，最终又回到 [`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule)，可以认为调度循环永远都不会返回。
+
+![golang-scheduler-loop](go_concurrent.assets/2020-02-05-15808864354669-golang-scheduler-loop-2862522.png)
+
+**调度循环**
+
+这里介绍的是 Goroutine 正常执行并退出的逻辑，实际情况会复杂得多，多数情况下 Goroutine 在执行的过程中都会经历协作式或者抢占式调度，它会让出线程的使用权等待调度器的唤醒。
+
+### 触发调度
+
+这里简单介绍下所有触发调度的时间点，因为调度器的 [`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule) 会重新选择 Goroutine 在线程上执行，所以只要找到该函数的调用方就能找到所有触发调度的时间点，经过分析和整理，能得到如下的树形结构：
+
+![schedule-points](go_concurrent.assets/2020-02-05-15808864354679-schedule-points-2862522.png)
+
+**调度时间点**
+
+除了上图中可能触发调度的时间点，运行时还会在线程启动 [`runtime.mstart`](https://draveness.me/golang/tree/runtime.mstart) 和 Goroutine 执行结束 [`runtime.goexit0`](https://draveness.me/golang/tree/runtime.goexit0) 触发调度。在这里会重点介绍运行时触发调度的几个路径：
+
+- 主动挂起 — [`runtime.gopark`](https://draveness.me/golang/tree/runtime.gopark) -> [`runtime.park_m`](https://draveness.me/golang/tree/runtime.park_m)
+- 系统调用 — [`runtime.exitsyscall`](https://draveness.me/golang/tree/runtime.exitsyscall) -> [`runtime.exitsyscall0`](https://draveness.me/golang/tree/runtime.exitsyscall0)
+- 协作式调度 — [`runtime.Gosched`](https://draveness.me/golang/tree/runtime.Gosched) -> [`runtime.gosched_m`](https://draveness.me/golang/tree/runtime.gosched_m) -> [`runtime.goschedImpl`](https://draveness.me/golang/tree/runtime.goschedImpl)
+- 系统监控 — [`runtime.sysmon`](https://draveness.me/golang/tree/runtime.sysmon) -> [`runtime.retake`](https://draveness.me/golang/tree/runtime.retake) -> [`runtime.preemptone`](https://draveness.me/golang/tree/runtime.preemptone)
+
+在这里介绍的调度时间点不是将线程的运行权直接交给其他任务，而是通过调度器的 [`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule) 重新调度。
+
+#### 主动挂起
+
+[`runtime.gopark`](https://draveness.me/golang/tree/runtime.gopark) 是触发调度最常见的方法，该函数会将当前 Goroutine 暂停，被暂停的任务不会放回运行队列，来分析该函数的实现原理：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason waitReason, traceEv byte, traceskip int) {
+	mp := acquirem()
+	gp := mp.curg
+	mp.waitlock = lock
+	mp.waitunlockf = unlockf
+	gp.waitreason = reason
+	mp.waittraceev = traceEv
+	mp.waittraceskip = traceskip
+	releasem(mp)
+	mcall(park_m)
+}
+```
+
+上述会通过 [`runtime.mcall`](https://draveness.me/golang/tree/runtime.mcall) 切换到 g0 的栈上调用 [`runtime.park_m`](https://draveness.me/golang/tree/runtime.park_m)：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func park_m(gp *g) {
+	_g_ := getg()
+
+	casgstatus(gp, _Grunning, _Gwaiting)
+	dropg()
+
+	schedule()
+}
+```
+
+[`runtime.park_m`](https://draveness.me/golang/tree/runtime.park_m) 会将当前 Goroutine 的状态从 `_Grunning` 切换至 `_Gwaiting`，调用 [`runtime.dropg`](https://draveness.me/golang/tree/runtime.dropg) 移除线程和 Goroutine 之间的关联，在这之后就可以调用 [`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule) 触发新一轮的调度了。
+
+当 Goroutine 等待的特定条件满足后，运行时会调用 [`runtime.goready`](https://draveness.me/golang/tree/runtime.goready) 将因为调用 [`runtime.gopark`](https://draveness.me/golang/tree/runtime.gopark) 而陷入休眠的 Goroutine 唤醒。
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func goready(gp *g, traceskip int) {
+	systemstack(func() {
+		ready(gp, traceskip, true)
+	})
+}
+
+func ready(gp *g, traceskip int, next bool) {
+	_g_ := getg()
+
+	casgstatus(gp, _Gwaiting, _Grunnable)
+	runqput(_g_.m.p.ptr(), gp, next)
+	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 {
+		wakep()
+	}
+}
+```
+
+[`runtime.ready`](https://draveness.me/golang/tree/runtime.ready) 会将准备就绪的 Goroutine 的状态切换至 `_Grunnable` 并将其加入处理器的运行队列中，等待调度器的调度。
+
+#### 系统调用
+
+系统调用也会触发运行时调度器的调度，为了处理特殊的系统调用，甚至在 Goroutine 中加入了 `_Gsyscall` 状态，Go 语言通过 [`syscall.Syscall`](https://draveness.me/golang/tree/syscall.Syscall) 和 [`syscall.RawSyscall`](https://draveness.me/golang/tree/syscall.RawSyscall) 等使用汇编语言编写的方法封装操作系统提供的所有系统调用，其中 [`syscall.Syscall`](https://draveness.me/golang/tree/syscall.Syscall) 的实现如下：
+
+```go
+// github.com/golang/go/src/syscall/asm_linux_386.s
+#define INVOKE_SYSCALL	INT	$0x80
+
+TEXT ·Syscall(SB),NOSPLIT,$0-28
+	CALL	runtime·entersyscall(SB)
+	...
+	INVOKE_SYSCALL
+	...
+	CALL	runtime·exitsyscall(SB)
+	RET
+ok:
+	...
+	CALL	runtime·exitsyscall(SB)
+	RET
+```
+
+在通过汇编指令 `INVOKE_SYSCALL` 执行系统调用前后，上述函数会调用运行时的 [`runtime.entersyscall`](https://draveness.me/golang/tree/runtime.entersyscall) 和 [`runtime.exitsyscall`](https://draveness.me/golang/tree/runtime.exitsyscall)，正是这一层包装能够在陷入系统调用前触发运行时的准备和清理工作。
+
+![golang-syscall-and-rawsyscal](go_concurrent.assets/2020-02-05-15808864354688-golang-syscall-and-rawsyscall-2862522.png)
+
+**Go 语言系统调用**
+
+不过出于性能的考虑，如果这次系统调用不需要运行时参与，就会使用 [`syscall.RawSyscall`](https://draveness.me/golang/tree/syscall.RawSyscall) 简化这一过程，不再调用运行时函数。[这里](https://gist.github.com/draveness/50c88883f30fa99d548cf1163c98aeb1)包含 Go 语言对 Linux 386 架构上不同系统调用的分类，会按需决定是否需要运行时的参与。
+
+|     系统调用     |    类型    |
+| :--------------: | :--------: |
+|     SYS_TIME     | RawSyscall |
+| SYS_GETTIMEOFDAY | RawSyscall |
+|  SYS_SETRLIMIT   | RawSyscall |
+|  SYS_GETRLIMIT   | RawSyscall |
+|  SYS_EPOLL_WAIT  |  Syscall   |
+|        …         |     …      |
+
+**系统调用的类型**
+
+由于直接进行系统调用会阻塞当前的线程，所以只有可以立刻返回的系统调用才可能会被设置成 `RawSyscall` 类型，例如：`SYS_EPOLL_CREATE`、`SYS_EPOLL_WAIT`（超时时间为 0）、`SYS_TIME` 等。
+
+正常的系统调用过程相对比较复杂，下面将分别介绍进入系统调用前的准备工作和系统调用结束后的收尾工作。
+
+##### 准备工作
+
+[`runtime.entersyscall`](https://draveness.me/golang/tree/runtime.entersyscall) 会在获取当前程序计数器和栈位置之后调用 [`runtime.reentersyscall`](https://draveness.me/golang/tree/runtime.reentersyscall)，它会完成 Goroutine 进入系统调用前的准备工作：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func reentersyscall(pc, sp uintptr) {
+	_g_ := getg()
+	_g_.m.locks++
+	_g_.stackguard0 = stackPreempt
+	_g_.throwsplit = true
+
+	save(pc, sp)
+	_g_.syscallsp = sp
+	_g_.syscallpc = pc
+	casgstatus(_g_, _Grunning, _Gsyscall)
+
+	_g_.m.syscalltick = _g_.m.p.ptr().syscalltick
+	_g_.m.mcache = nil
+	pp := _g_.m.p.ptr()
+	pp.m = 0
+	_g_.m.oldp.set(pp)
+	_g_.m.p = 0
+	atomic.Store(&pp.status, _Psyscall)
+	if sched.gcwaiting != 0 {
+		systemstack(entersyscall_gcwait)
+		save(pc, sp)
+	}
+	_g_.m.locks--
+}
+```
+
+1. 禁止线程上发生的抢占，防止出现内存不一致的问题；
+2. 保证当前函数不会触发栈分裂或者增长；
+3. 保存当前的程序计数器 PC 和栈指针 SP 中的内容；
+4. 将 Goroutine 的状态更新至 `_Gsyscall`；
+5. 将 Goroutine 的处理器和线程暂时分离并更新处理器的状态到 `_Psyscall`；
+6. 释放当前线程上的锁；
+
+需要注意的是 [`runtime.reentersyscall`](https://draveness.me/golang/tree/runtime.reentersyscall) 会使处理器和线程的分离，当前线程会陷入系统调用等待返回，在锁被释放后，会有其他 Goroutine 抢占处理器资源。
+
+##### 恢复工作
+
+当系统调用结束后，会调用退出系统调用的函数 [`runtime.exitsyscall`](https://draveness.me/golang/tree/runtime.exitsyscall) 为当前 Goroutine 重新分配资源，该函数有两个不同的执行路径：
+
+1. 调用 [`runtime.exitsyscallfast`](https://draveness.me/golang/tree/runtime.exitsyscallfast)；
+2. 切换至调度器的 Goroutine 并调用 [`runtime.exitsyscall0`](https://draveness.me/golang/tree/runtime.exitsyscall0)；
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func exitsyscall() {
+	_g_ := getg()
+
+	oldp := _g_.m.oldp.ptr()
+	_g_.m.oldp = 0
+	if exitsyscallfast(oldp) {
+		_g_.m.p.ptr().syscalltick++
+		casgstatus(_g_, _Gsyscall, _Grunning)
+		...
+
+		return
+	}
+
+	mcall(exitsyscall0)
+	_g_.m.p.ptr().syscalltick++
+	_g_.throwsplit = false
+}
+```
+
+这两种不同的路径会分别通过不同的方法查找一个用于执行当前 Goroutine 处理器 P，快速路径 [`runtime.exitsyscallfast`](https://draveness.me/golang/tree/runtime.exitsyscallfast) 中包含两个不同的分支：
+
+1. 如果 Goroutine 的原处理器处于 `_Psyscall` 状态，会直接调用 `wirep` 将 Goroutine 与处理器进行关联；
+2. 如果调度器中存在闲置的处理器，会调用 [`runtime.acquirep`](https://draveness.me/golang/tree/runtime.acquirep) 使用闲置的处理器处理当前 Goroutine；
+
+另一个相对较慢的路径 [`runtime.exitsyscall0`](https://draveness.me/golang/tree/runtime.exitsyscall0) 会将当前 Goroutine 切换至 `_Grunnable` 状态，并移除线程 M 和当前 Goroutine 的关联：
+
+1. 当通过 [`runtime.pidleget`](https://draveness.me/golang/tree/runtime.pidleget) 获取到闲置的处理器时就会在该处理器上执行 Goroutine；
+2. 在其它情况下，会将当前 Goroutine 放到全局的运行队列中，等待调度器的调度；
+
+无论哪种情况，在这个函数中都会调用 [`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule) 触发调度器的调度，因为已经介绍过调度器的调度过程，所以在这里就不展开了。
+
+#### 协作式调度
+
+在设计原理中介绍过了 Go 语言基于协作式和信号的两种抢占式调度，这里主要介绍其中的协作式调度。
+
+[`runtime.Gosched`](https://draveness.me/golang/tree/runtime.Gosched) 函数会主动让出处理器，允许其他 Goroutine 运行。该函数无法挂起 Goroutine，调度器可能会将当前 Goroutine 调度到其他线程上：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func Gosched() {
+	checkTimeouts()
+	mcall(gosched_m)
+}
+
+func gosched_m(gp *g) {
+	goschedImpl(gp)
+}
+
+func goschedImpl(gp *g) {
+	casgstatus(gp, _Grunning, _Grunnable)
+	dropg()
+	lock(&sched.lock)
+	globrunqput(gp)
+	unlock(&sched.lock)
+
+	schedule()
+}
+```
+
+经过连续几次跳转，最终在 g0 的栈上调用 [`runtime.goschedImpl`](https://draveness.me/golang/tree/runtime.goschedImpl)，运行时会更新 Goroutine 的状态到 `_Grunnable`，让出当前的处理器并将 Goroutine 重新放回全局队列，在最后，该函数会调用 [`runtime.schedule`](https://draveness.me/golang/tree/runtime.schedule) 触发调度。
+
+### 线程管理
+
+Go 语言的运行时会通过调度器改变线程的所有权，它也提供了 [`runtime.LockOSThread`](https://draveness.me/golang/tree/runtime.LockOSThread) 和 [`runtime.UnlockOSThread`](https://draveness.me/golang/tree/runtime.UnlockOSThread) 绑定 Goroutine 和线程完成一些比较特殊的操作。
+
+Goroutine 应该在调用操作系统服务或者依赖线程状态的非 Go 语言库时调用 [`runtime.LockOSThread`](https://draveness.me/golang/tree/runtime.LockOSThread) 函数，例如：C 语言图形库等。
+
+[`runtime.LockOSThread`](https://draveness.me/golang/tree/runtime.LockOSThread) 会通过如下所示的代码绑定 Goroutine 和当前线程：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func LockOSThread() {
+	if atomic.Load(&newmHandoff.haveTemplateThread) == 0 && GOOS != "plan9" {
+		startTemplateThread()
+	}
+	_g_ := getg()
+	_g_.m.lockedExt++
+	dolockOSThread()
+}
+
+func dolockOSThread() {
+	_g_ := getg()
+	_g_.m.lockedg.set(_g_)
+	_g_.lockedm.set(_g_.m)
+}
+```
+
+[`runtime.dolockOSThread`](https://draveness.me/golang/tree/runtime.dolockOSThread) 会分别设置线程的 `lockedg` 字段和 Goroutine 的 `lockedm` 字段，这两行代码会绑定线程和 Goroutine。
+
+当 Goroutine 完成了特定的操作之后，会调用以下函数 [`runtime.UnlockOSThread`](https://draveness.me/golang/tree/runtime.UnlockOSThread) 分离 Goroutine 和线程：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func UnlockOSThread() {
+	_g_ := getg()
+	if _g_.m.lockedExt == 0 {
+		return
+	}
+	_g_.m.lockedExt--
+	dounlockOSThread()
+}
+
+func dounlockOSThread() {
+	_g_ := getg()
+	if _g_.m.lockedInt != 0 || _g_.m.lockedExt != 0 {
+		return
+	}
+	_g_.m.lockedg = 0
+	_g_.lockedm = 0
+}
+```
+
+函数执行的过程与 [`runtime.LockOSThread`](https://draveness.me/golang/tree/runtime.LockOSThread) 正好相反。在多数的服务中，都用不到这一对函数，不过使用 CGO 或者经常与操作系统打交道可能会见到它们的身影。
+
+#### 线程生命周期
+
+Go 语言的运行时会通过 [`runtime.startm`](https://draveness.me/golang/tree/runtime.startm) 启动线程来执行处理器 P，如果在该函数中没能从闲置列表中获取到线程 M 就会调用 [`runtime.newm`](https://draveness.me/golang/tree/runtime.newm) 创建新的线程：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func newm(fn func(), _p_ *p, id int64) {
+	mp := allocm(_p_, fn, id)
+	mp.nextp.set(_p_)
+	mp.sigmask = initSigmask
+	...
+	newm1(mp)
+}
+
+func newm1(mp *m) {
+	if iscgo {
+		...
+	}
+	newosproc(mp)
+}
+```
+
+创建新的线程需要使用如下所示的 [`runtime.newosproc`](https://draveness.me/golang/tree/runtime.newosproc)，该函数在 Linux 平台上会通过系统调用 `clone` 创建新的操作系统线程，它也是创建线程链路上距离操作系统最近的 Go 语言函数：
+
+```go
+// github.com/golang/go/src/runtime/os_linux.go
+func newosproc(mp *m) {
+	stk := unsafe.Pointer(mp.g0.stack.hi)
+	...
+	ret := clone(cloneFlags, stk, unsafe.Pointer(mp), unsafe.Pointer(mp.g0), unsafe.Pointer(funcPC(mstart)))
+	...
+}
+```
+
+使用系统调用 `clone` 创建的线程会在线程主动调用 `exit`、或者传入的函数 [`runtime.mstart`](https://draveness.me/golang/tree/runtime.mstart) 返回会主动退出，[`runtime.mstart`](https://draveness.me/golang/tree/runtime.mstart) 会执行调用 [`runtime.newm`](https://draveness.me/golang/tree/runtime.newm) 时传入的匿名函数 `fn`，到这里也就完成了从线程创建到销毁的整个闭环。
+
+### 小结
+
+Goroutine 和调度器是 Go 语言能够高效地处理任务并且最大化利用资源的基础，本节介绍了 Go 语言用于处理并发任务的 G - M - P 模型，不仅介绍了它们各自的数据结构以及常见状态，还通过特定场景介绍调度器的工作原理以及不同数据结构之间的协作关系，相信能够帮助理解调度器的实现。
+
+### 参考
+
+- [How Erlang does scheduling](http://jlouisramblings.blogspot.com/2013/01/how-erlang-does-scheduling.html)
+- [Analysis of the Go runtime scheduler](http://www.cs.columbia.edu/~aho/cs6998/reports/12-12-11_DeshpandeSponslerWeiss_GO.pdf)
+- [Go’s work-stealing scheduler](https://rakyll.org/scheduler/)
+- [cmd/compile: insert scheduling checks on loop backedges](https://github.com/golang/go/commit/7f1ff65c3947b916cc4d0827fd8c1307d7efd7bf)
+- [runtime: clean up async preemption loose ends](https://github.com/golang/go/issues/36365)
+- [Proposal: Non-cooperative goroutine preemption](https://github.com/golang/proposal/blob/master/design/24543-non-cooperative-preemption.md)
+- [Proposal: Conservative inner-frame scanning for non-cooperative goroutine preemption](https://github.com/golang/proposal/blob/master/design/24543/conservative-inner-frame.md)
+- [NUMA-aware scheduler for Go](https://docs.google.com/document/u/0/d/1d3iI2QWURgDIsSR6G2275vMeQ_X7w-qxM2Vp7iGwwuM/pub)
+- [The Go scheduler](http://morsmachine.dk/go-scheduler)
+- [Why goroutines are not lightweight threads?](https://codeburst.io/why-goroutines-are-not-lightweight-threads-7c460c1f155f)
+- [Scheduling In Go : Part I - OS Scheduler](https://www.ardanlabs.com/blog/2018/08/scheduling-in-go-part1.html)
+- [Scheduling In Go : Part II - Go Scheduler](https://www.ardanlabs.com/blog/2018/08/scheduling-in-go-part2.html)
+- [Scheduling In Go : Part III - Concurrency](https://www.ardanlabs.com/blog/2018/12/scheduling-in-go-part3.html)
+- [System Calls Make the World Go Round](https://manybutfinite.com/post/system-calls/)
+- [Linux Syscall Reference](https://syscalls.kernelgrok.com/)
+- [Go: Concurrency & Scheduler Affinity](https://medium.com/a-journey-with-go/go-concurrency-scheduler-affinity-3b678f490488)
+- [Go: g0, Special Goroutine](https://medium.com/a-journey-with-go/go-g0-special-goroutine-8c778c6704d8)
+- [runtime: big performance penalty with runtime.LockOSThread #21827](https://github.com/golang/go/issues/21827)
+- [runtime: don’t clear lockedExt on locked M when G exits](https://github.com/golang/go/commit/d0f8a7517ab0b33c8e3dd49294800dd6144e4cee)
+- Eli Bendersky. 2018. “Measuring context switching and memory overheads for Linux threads” https://eli.thegreenplace.net/2018/measuring-context-switching-and-memory-overheads-for-linux-threads/ 
+- Goroutine 上下文切换时间待确认；
+- Scalable Go Scheduler Design Doc http://golang.org/s/go11sched 
+- Pre-emption in the scheduler https://golang.org/doc/go1.2#preemption 
+- Go Preemptive Scheduler Design Doc https://docs.google.com/document/d/1ETuA2IOmnaQ4j81AtTGT40Y4_Jr6_IDASEKg0t0dBR8/edit#heading=h.3pilqarbrc9h 
+- runtime: goroutines do not get scheduled for a long time for no obvious reason https://github.com/golang/go/issues/4711#issuecomment-66073943 
+- Proposal: Non-cooperative goroutine preemption https://github.com/golang/proposal/blob/master/design/24543-non-cooperative-preemption.md#other-considerations 
+- Proposal: Conservative inner-frame scanning for non-cooperative goroutine preemption https://github.com/golang/proposal/blob/master/design/24543/conservative-inner-frame.md 
+- NUMA-aware scheduler for Go https://docs.google.com/document/u/0/d/1d3iI2QWURgDIsSR6G2275vMeQ_X7w-qxM2Vp7iGwwuM/pub 
+- Why is there no goroutine ID? https://golang.org/doc/faq#no_goroutine_id 
+- LockOSThread · package runtime https://golang.org/pkg/runtime/#LockOSThread 
 
 
 
+## 网络轮询器
 
 
 
