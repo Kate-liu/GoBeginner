@@ -5023,9 +5023,377 @@ Goroutine 在被唤醒之后会意识到当前的 I/O 操作已经超时，可�
 
 ## 系统监控
 
+很多系统中都有守护进程，它们能够在后台监控系统的运行状态，在出现意外情况时及时响应。系统监控是 Go 语言运行时的重要组成部分，它会每隔一段时间检查 Go 语言运行时，确保程序没有进入异常状态。
+
+本节会介绍 Go 语言系统监控的设计与实现原理，包括它的启动、执行过程以及主要职责。
+
+### 设计原理
+
+在支持多任务的操作系统中，守护进程是在后台运行的计算机程序，它不会由用户直接操作，它一般会在操作系统启动时自动运行。Kubernetes 的 DaemonSet 和 Go 语言的系统监控都使用类似设计提供一些通用的功能：
+
+![golang-system-monitor](go_concurrent.assets/2020-02-15-15817706777634-golang-system-monitor.png)
+
+**Go 语言系统监控**
+
+守护进程是很有效的设计，它在整个系统的生命周期中都会存在，会随着系统的启动而启动，系统的结束而结束。在操作系统和 Kubernetes 中，经常会将数据库服务、日志服务以及监控服务等进程作为守护进程运行。
+
+Go 语言的系统监控也起到了很重要的作用，它在内部启动了一个不会中止的循环，在循环的内部会轮询网络、抢占长期运行或者处于系统调用的 Goroutine 以及触发垃圾回收，通过这些行为，它能够让系统的运行状态变得更健康。
+
+### 监控循环
+
+当 Go 语言程序启动时，运行时会在第一个 Goroutine 中调用 [`runtime.main`](https://draveness.me/golang/tree/runtime.main) 启动主程序，该函数会在系统栈中创建新的线程：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func main() {
+	...
+	if GOARCH != "wasm" {
+		systemstack(func() {
+			newm(sysmon, nil)
+		})
+	}
+	...
+}
+```
+
+[`runtime.newm`](https://draveness.me/golang/tree/runtime.newm) 会创建一个存储待执行函数和处理器的新结构体 [`runtime.m`](https://draveness.me/golang/tree/runtime.m)。运行时执行系统监控不需要处理器，系统监控的 Goroutine 会直接在创建的线程上运行：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func newm(fn func(), _p_ *p) {
+	mp := allocm(_p_, fn)
+	mp.nextp.set(_p_)
+	mp.sigmask = initSigmask
+	...
+	newm1(mp)
+}
+```
+
+[`runtime.newm1`](https://draveness.me/golang/tree/runtime.newm1) 会调用特定平台的 [`runtime.newosproc`](https://draveness.me/golang/tree/runtime.newosproc) 通过系统调用 `clone` 创建一个新的线程并在新的线程中执行 [`runtime.mstart`](https://draveness.me/golang/tree/runtime.mstart)：
+
+```go
+// github.com/golang/go/src/runtime/os_linux.go
+func newosproc(mp *m) {
+	stk := unsafe.Pointer(mp.g0.stack.hi)
+	var oset sigset
+	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
+	ret := clone(cloneFlags, stk, unsafe.Pointer(mp), unsafe.Pointer(mp.g0), unsafe.Pointer(funcPC(mstart)))
+	sigprocmask(_SIG_SETMASK, &oset, nil)
+	...
+}
+```
+
+在新创建的线程中，会执行存储在 [`runtime.m`](https://draveness.me/golang/tree/runtime.m) 中的 [`runtime.sysmon`](https://draveness.me/golang/tree/runtime.sysmon) 启动系统监控：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func sysmon() {
+	sched.nmsys++
+	checkdead()
+
+	lasttrace := int64(0)
+	idle := 0
+	delay := uint32(0)
+	for {
+		if idle == 0 {
+			delay = 20
+		} else if idle > 50 {
+			delay *= 2
+		}
+		if delay > 10*1000 {
+			delay = 10 * 1000
+		}
+		usleep(delay)
+		...
+	}
+}
+```
+
+当运行时刚刚调用上述函数时，会先通过 [`runtime.checkdead`](https://draveness.me/golang/tree/runtime.checkdead) 检查是否存在死锁，然后进入核心的监控循环；系统监控在每次循环开始时都会通过 `usleep` 挂起当前线程，该函数的参数是微秒，运行时会遵循以下的规则决定休眠时间：
+
+- 初始的休眠时间是 20μs；
+- 最长的休眠时间是 10ms；
+- 当系统监控在 50 个循环中都没有唤醒 Goroutine 时，休眠时间在每个循环都会倍增；
+
+当程序趋于稳定之后，系统监控的触发时间就会稳定在 10ms。它除了会检查死锁之外，还会在循环中完成以下的工作：
+
+- 运行计时器 — 获取下一个需要被触发的计时器；
+- 轮询网络 — 获取需要处理的到期文件描述符；
+- 抢占处理器 — 抢占运行时间较长的或者处于系统调用的 Goroutine；
+- 垃圾回收 — 在满足条件时触发垃圾收集回收内存；
+
+在这一节中会依次介绍系统监控是如何完成上述几种不同工作的。
+
+#### 检查死锁
+
+系统监控通过 [`runtime.checkdead`](https://draveness.me/golang/tree/runtime.checkdead) 检查运行时是否发生了死锁，可以将检查死锁的过程分成以下三个步骤：
+
+1. 检查是否存在正在运行的线程；
+2. 检查是否存在正在运行的 Goroutine；
+3. 检查处理器上是否存在计时器；
+
+该函数首先会检查 Go 语言运行时中正在运行的线程数量，通过调度器中的多个字段计算该值的结果：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func checkdead() {
+	var run0 int32
+	run := mcount() - sched.nmidle - sched.nmidlelocked - sched.nmsys
+	if run > run0 {
+		return
+	}
+	if run < 0 {
+		print("runtime: checkdead: nmidle=", sched.nmidle, " nmidlelocked=", sched.nmidlelocked, " mcount=", mcount(), " nmsys=", sched.nmsys, "\n")
+		throw("checkdead: inconsistent counts")
+	}
+	...
+}
+```
+
+1. [`runtime.mcount`](https://draveness.me/golang/tree/runtime.mcount) 根据下一个待创建的线程 id 和释放的线程数得到系统中存在的线程数；
+2. `nmidle` 是处于空闲状态的线程数量；
+3. `nmidlelocked` 是处于锁定状态的线程数量；
+4. `nmsys` 是处于系统调用的线程数量；
+
+利用上述几个线程相关数据，可以得到正在运行的线程数，如果线程数量大于 0，说明当前程序不存在死锁；如果线程数小于 0，说明当前程序的状态不一致；如果线程数等于 0，需要进一步检查程序的运行状态：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func checkdead() {
+	...
+	grunning := 0
+	for i := 0; i < len(allgs); i++ {
+		gp := allgs[i]
+		if isSystemGoroutine(gp, false) {
+			continue
+		}
+		s := readgstatus(gp)
+		switch s &^ _Gscan {
+		case _Gwaiting, _Gpreempted:
+			grunning++
+		case _Grunnable, _Grunning, _Gsyscall:
+			print("runtime: checkdead: find g ", gp.goid, " in status ", s, "\n")
+			throw("checkdead: runnable g")
+		}
+	}
+	unlock(&allglock)
+	if grunning == 0 {
+		throw("no goroutines (main called runtime.Goexit) - deadlock!")
+	}
+	...
+}
+```
+
+1. 当存在 Goroutine 处于 `_Grunnable`、`_Grunning` 和 `_Gsyscall` 状态时，意味着程序发生了死锁；
+2. 当所有的 Goroutine 都处于 `_Gidle`、`_Gdead` 和 `_Gcopystack` 状态时，意味着主程序调用了 [`runtime.goexit`](https://draveness.me/golang/tree/runtime.goexit)；
+
+当运行时存在等待的 Goroutine 并且不存在正在运行的 Goroutine 时，会检查处理器中存在的计时器：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func checkdead() {
+	...
+	for _, _p_ := range allp {
+		if len(_p_.timers) > 0 {
+			return
+		}
+	}
+
+	throw("all goroutines are asleep - deadlock!")
+}
+```
+
+如果处理器中存在等待的计时器，那么所有的 Goroutine 陷入休眠状态是合理的，不过如果不存在等待的计时器，运行时会直接报错并退出程序。
+
+#### 运行计时器
+
+在系统监控的循环中，通过 [`runtime.nanotime`](https://draveness.me/golang/tree/runtime.nanotime) 和 [`runtime.timeSleepUntil`](https://draveness.me/golang/tree/runtime.timeSleepUntil) 获取当前时间和计时器下一次需要唤醒的时间；当前调度器需要执行垃圾回收或者所有处理器都处于闲置状态时，如果没有需要触发的计时器，那么系统监控可以暂时陷入休眠：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func sysmon() {
+	...
+	for {
+		...
+		now := nanotime()
+		next, _ := timeSleepUntil()
+		if debug.schedtrace <= 0 && (sched.gcwaiting != 0 || atomic.Load(&sched.npidle) == uint32(gomaxprocs)) {
+			lock(&sched.lock)
+			if atomic.Load(&sched.gcwaiting) != 0 || atomic.Load(&sched.npidle) == uint32(gomaxprocs) {
+				if next > now {
+					atomic.Store(&sched.sysmonwait, 1)
+					unlock(&sched.lock)
+					sleep := forcegcperiod / 2
+					if next-now < sleep {
+						sleep = next - now
+					}
+					...
+					notetsleep(&sched.sysmonnote, sleep)
+					...
+					now = nanotime()
+					next, _ = timeSleepUntil()
+					lock(&sched.lock)
+					atomic.Store(&sched.sysmonwait, 0)
+					noteclear(&sched.sysmonnote)
+				}
+				idle = 0
+				delay = 20
+			}
+			unlock(&sched.lock)
+		}
+		...
+		if next < now {
+			startm(nil, false)
+		}
+	}
+}
+```
+
+休眠的时间会依据强制 GC 的周期 `forcegcperiod` 和计时器下次触发的时间确定，[`runtime.notesleep`](https://draveness.me/golang/tree/runtime.notesleep) 会使用信号量同步系统监控即将进入休眠的状态。当系统监控被唤醒之后，会重新计算当前时间和下一个计时器需要触发的时间、调用 [`runtime.noteclear`](https://draveness.me/golang/tree/runtime.noteclear) 通知系统监控被唤醒并重置休眠的间隔。
+
+如果在这之后，发现下一个计时器需要触发的时间小于当前时间，这也说明所有的线程可能正在忙于运行 Goroutine，系统监控会启动新的线程来触发计时器，避免计时器的到期时间有较大的偏差。
+
+#### 轮询网络
+
+如果上一次轮询网络已经过去了 10ms，那么系统监控还会在循环中轮询网络，检查是否有待执行的文件描述符：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func sysmon() {
+	...
+	for {
+		...
+		lastpoll := int64(atomic.Load64(&sched.lastpoll))
+		if netpollinited() && lastpoll != 0 && lastpoll+10*1000*1000 < now {
+			atomic.Cas64(&sched.lastpoll, uint64(lastpoll), uint64(now))
+			list := netpoll(0)
+			if !list.empty() {
+				incidlelocked(-1)
+				injectglist(&list)
+				incidlelocked(1)
+			}
+		}
+		...
+	}
+}
+```
+
+上述函数会非阻塞地调用 [`runtime.netpoll`](https://draveness.me/golang/tree/runtime.netpoll) 检查待执行的文件描述符并通过 [`runtime.injectglist`](https://draveness.me/golang/tree/runtime.injectglist) 将所有处于就绪状态的 Goroutine 加入全局运行队列中：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func injectglist(glist *gList) {
+	if glist.empty() {
+		return
+	}
+	lock(&sched.lock)
+	var n int
+	for n = 0; !glist.empty(); n++ {
+		gp := glist.pop()
+		casgstatus(gp, _Gwaiting, _Grunnable)
+		globrunqput(gp)
+	}
+	unlock(&sched.lock)
+	for ; n != 0 && sched.npidle != 0; n-- {
+		startm(nil, false)
+	}
+	*glist = gList{}
+}
+```
+
+该函数会将所有 Goroutine 的状态从 `_Gwaiting` 切换至 `_Grunnable` 并加入全局运行队列等待运行，如果当前程序中存在空闲的处理器，会通过 [`runtime.startm`](https://draveness.me/golang/tree/runtime.startm) 启动线程来执行这些任务。
+
+#### 抢占处理器
+
+系统监控会在循环中调用 [`runtime.retake`](https://draveness.me/golang/tree/runtime.retake) 抢占处于运行或者系统调用中的处理器，该函数会遍历运行时的全局处理器，每个处理器都存储了一个 [`runtime.sysmontick`](https://draveness.me/golang/tree/runtime.sysmontick)：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+type sysmontick struct {
+	schedtick   uint32
+	schedwhen   int64
+	syscalltick uint32
+	syscallwhen int64
+}
+```
+
+该结构体中的四个字段分别存储了处理器的调度次数、处理器上次调度时间、系统调用的次数以及系统调用的时间。[`runtime.retake`](https://draveness.me/golang/tree/runtime.retake) 的循环包含了两种不同的抢占逻辑：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func retake(now int64) uint32 {
+	n := 0
+	for i := 0; i < len(allp); i++ {
+		_p_ := allp[i]
+		pd := &_p_.sysmontick
+		s := _p_.status
+		if s == _Prunning || s == _Psyscall {
+			t := int64(_p_.schedtick)
+			if pd.schedwhen+forcePreemptNS <= now {
+				preemptone(_p_)
+			}
+		}
+
+		if s == _Psyscall {
+			if runqempty(_p_) && atomic.Load(&sched.nmspinning)+atomic.Load(&sched.npidle) > 0 && pd.syscallwhen+10*1000*1000 > now {
+				continue
+			}
+			if atomic.Cas(&_p_.status, s, _Pidle) {
+				n++
+				_p_.syscalltick++
+				handoffp(_p_)
+			}
+		}
+	}
+	return uint32(n)
+}
+```
+
+1. 当处理器处于 `_Prunning` 或者 `_Psyscall` 状态时，如果上一次触发调度的时间已经过去了 10ms，会通过 [`runtime.preemptone`](https://draveness.me/golang/tree/runtime.preemptone) 抢占当前处理器；
+
+2. 当处理器处于 `_Psyscall` 状态时，在满足以下两种情况下会调用 `runtime.handoffp` 让出处理器的使用权：
+
+   1. 当处理器的运行队列不为空或者不存在空闲处理器时；
+   2. 当系统调用时间超过了 10ms 时；
+
+系统监控通过在循环中抢占处理器来避免同一个 Goroutine 占用线程太长时间造成饥饿问题。
+
+#### 垃圾回收
+
+在最后，系统监控还会决定是否需要触发强制垃圾回收，[`runtime.sysmon`](https://draveness.me/golang/tree/runtime.sysmon) 会构建 [`runtime.gcTrigger`](https://draveness.me/golang/tree/runtime.gcTrigger) 并调用 [`runtime.gcTrigger.test`](https://draveness.me/golang/tree/runtime.gcTrigger.test) 方法判断是否需要触发垃圾回收：
+
+```go
+// github.com/golang/go/src/runtime/proc.go
+func sysmon() {
+	...
+	for {
+		...
+		if t := (gcTrigger{kind: gcTriggerTime, now: now}); t.test() && atomic.Load(&forcegc.idle) != 0 {
+			lock(&forcegc.lock)
+			forcegc.idle = 0
+			var list gList
+			list.push(forcegc.g)
+			injectglist(&list)
+			unlock(&forcegc.lock)
+		}
+		...
+	}
+}
+```
+
+如果需要触发垃圾回收，会将用于垃圾回收的 Goroutine 加入全局队列，让调度器选择合适的处理器去执行。
+
+### 小结
+
+运行时通过系统监控来触发线程的抢占、网络的轮询和垃圾回收，保证 Go 语言运行时的可用性。系统监控能够很好地解决尾延迟的问题，减少调度器调度 Goroutine 的饥饿问题并保证计时器在尽可能准确的时间触发。
 
 
 
+### 参考
+
+1. Ian Lance Taylor. Apr 2019. “runtime: initial scheduler changes for timers on P’s” https://github.com/golang/go/commit/06ac26279cb93140bb2b03bcef9a3300c166cade 
+2. Dmitry Vyukov. Mar 2013. “runtime: improved scheduler” https://github.com/golang/go/commit/779c45a50700bda0f6ec98429720802e6c1624e8 
+3. Dmitry Vyukov. Jan 2014. “runtime: tune P retake logic” https://github.com/golang/go/commit/179d41feccc29260d1a16294647df218f1a6746a 
 
 
 
