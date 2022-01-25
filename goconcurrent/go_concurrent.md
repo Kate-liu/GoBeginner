@@ -404,7 +404,7 @@ Go 语言作为一个原生支持用户态进程（Goroutine）的语言，当�
 
 Go 语言中常见的同步原语 `sync.Mutex`、`sync.RWMutex`、`sync.WaitGroup`、`sync.Once` 和 `sync.Cond` 以及扩展原语 `golang/sync/errgroup.Group`、`golang/sync/semaphore.Weighted` 和 `golang/sync/singleflight.Group` 的实现原理，同时也会涉及互斥锁、信号量等并发编程中的常见概念。
 
-## 基本原语
+### 基本原语
 
 Go 语言在 `sync` 包中提供了用于同步的一些基本原语，包括常见的 `sync.Mutex`、`sync.RWMutex`、`sync.WaitGroup`、`sync.Once` 和 `sync.Cond`：
 
@@ -414,7 +414,7 @@ Go 语言在 `sync` 包中提供了用于同步的一些基本原语，包括常
 
 这些基本原语提供了较为基础的同步功能，但是它们是一种**相对原始的同步机制**，在多数情况下，都应该使用抽象层级更高的 Channel 实现同步。
 
-### Mutex
+#### Mutex
 
 Go 语言的 `sync.Mutex` 由两个字段 `state` 和 `sema` 组成。其中 `state` 表示当前互斥锁的状态，而 `sema` 是用于控制锁状态的信号量。
 
@@ -428,7 +428,7 @@ type Mutex struct {
 
 上述两个字段加起来只**占 8 字节空间**的结构体表示了 Go 语言中的互斥锁。
 
-#### 状态
+##### 状态
 
 互斥锁的状态比较复杂，如下图所示，最低三位分别表示 `mutexLocked`、`mutexWoken` 和 `mutexStarving`，剩下的位置用来表示当前有多少个 Goroutine 在等待互斥锁的释放：
 
@@ -454,7 +454,7 @@ const (
 )
 ```
 
-#### 正常模式和饥饿模式
+##### 正常模式和饥饿模式
 
 `sync.Mutex` 有两种模式 — 正常模式和饥饿模式。需要在这里先了解正常模式和饥饿模式都是什么以及它们有什么样的关系。
 
@@ -474,7 +474,7 @@ const (
 
 与饥饿模式相比，正常模式下的互斥锁能够提供更好地性能，饥饿模式能避免 Goroutine 由于陷入等待无法获取锁而造成的高尾延时。
 
-#### 加锁
+##### 加锁
 
 互斥锁的加锁和解锁过程，它们分别使用 `sync.Mutex.Lock` 和 `sync.Mutex.Unlock`方法。
 
@@ -641,7 +641,7 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 - 在正常模式下，这段代码会设置唤醒和饥饿标记、重置迭代次数并重新执行获取锁的循环；
 - 在饥饿模式下，当前 Goroutine 会获得互斥锁，如果等待队列中只存在当前 Goroutine，互斥锁还会从饥饿模式中退出；
 
-#### 解锁
+##### 解锁
 
 互斥锁的解锁过程 `sync.Mutex.Unlock`与加锁过程相比就很简单，该过程会先使用 `sync/atomic.AddInt32` 函数快速解锁，这时会发生下面的两种情况：
 
@@ -695,7 +695,7 @@ func (m *Mutex) unlockSlow(new int32) {
   - 如果互斥锁存在等待者，会通过 `sync.runtime_Semrelease` 唤醒等待者并移交锁的所有权；
 - 在饥饿模式下，上述代码会直接调用 `sync.runtime_Semrelease` 将当前锁交给下一个正在尝试获取锁的等待者，等待者被唤醒后会得到锁，在这时互斥锁还不会退出饥饿状态；
 
-#### 小结
+##### 小结
 
 已经从多个方面分析了互斥锁 `sync.Mutex` 的实现原理，这里从加锁和解锁两个方面总结注意事项。
 
@@ -715,7 +715,7 @@ func (m *Mutex) unlockSlow(new int32) {
 
 
 
-### RWMutex
+#### RWMutex
 
 读写互斥锁 `sync.RWMutex` 是细粒度的互斥锁，它不限制资源的并发读，但是读写操作和写写操作无法并行执行。
 
@@ -728,7 +728,7 @@ func (m *Mutex) unlockSlow(new int32) {
 
 常见服务的资源读写比例会非常高，因为大多数的读请求之间不会相互影响，所以可以**分离读写操作**，以此来提高服务的性能。
 
-#### 结构体
+##### 结构体
 
 `sync.RWMutex` 中总共包含以下 5 个字段：
 
@@ -753,7 +753,7 @@ type RWMutex struct {
 - 写操作使用 `sync.RWMutex.Lock` 和`sync.RWMutex.Unlock` 方法；
 - 读操作使用 `sync.RWMutex.RLock` 和 `sync.RWMutex.RUnlock`方法；
 
-#### 写锁
+##### 写锁
 
 当资源的使用者想要**获取写锁**时，需要调用 `sync.RWMutex.Lock` 方法：
 
@@ -811,7 +811,7 @@ func (rw *RWMutex) Unlock() {
 
 获取写锁时会先阻塞写锁的获取，后阻塞读锁的获取，这种策略能够保证读操作不会被连续的写操作『饿死』。
 
-#### 读锁
+##### 读锁
 
 **读锁的加锁**方法 `sync.RWMutex.RLock` 很简单，该方法会通过 `sync/atomic.AddInt32` 将 `readerCount` 加一：
 
@@ -863,7 +863,7 @@ func (rw *RWMutex) rUnlockSlow(r int32) {
 
 `sync.RWMutex.rUnlockSlow` 会减少获取锁的写操作等待的读操作数 `readerWait` ，并在所有读操作都被释放之后触发写操作的信号量 `writerSem`，该信号量被触发时，调度器就会唤醒尝试获取写锁的 Goroutine。
 
-#### 小结
+##### 小结
 
 虽然读写互斥锁 `sync.RWMutex` 提供的功能比较复杂，但是因为它建立在 `sync.Mutex` 上，所以实现会简单很多。总结一下读锁和写锁的关系：
 
@@ -878,7 +878,7 @@ func (rw *RWMutex) rUnlockSlow(r int32) {
 
 
 
-### WaitGroup
+#### WaitGroup
 
 `sync.WaitGroup`可以**等待一组 Goroutine 的返回**，一个比较常见的使用场景是批量发出 RPC 或者 HTTP 请求：
 
@@ -902,7 +902,7 @@ wg.Wait()
 
 **WaitGroup 等待多个 Goroutine**
 
-#### 结构体 
+##### 结构体 
 
 `sync.WaitGroup`结构体中只包含两个成员变量：
 
@@ -957,7 +957,7 @@ func (wg *WaitGroup) state() (statep *uint64, semap *uint32) {
 }
 ```
 
-#### 接口
+##### 接口
 
 `sync.WaitGroup`对外暴露了三个方法 — `sync.WaitGroup.Add`、`sync.WaitGroup.Wait` 和 `sync.WaitGroup.Done`。
 
@@ -1014,7 +1014,7 @@ func (wg *WaitGroup) Wait() {
 
 当 `sync.WaitGroup`的计数器归零时，陷入睡眠状态的 Goroutine 会被唤醒，上述方法也会立刻返回。
 
-#### 小结
+##### 小结
 
 通过对 `sync.WaitGroup`的分析和研究，能够得出以下结论：
 
@@ -1024,7 +1024,7 @@ func (wg *WaitGroup) Wait() {
 
 
 
-### Once
+#### Once
 
 Go 语言标准库中 `sync.Once` 可以保证在 Go 程序运行期间的某段代码只会执行一次。在运行如下所示的代码时，会看到如下所示的运行结果：
 
@@ -1042,7 +1042,7 @@ $ go run main.go
 only once
 ```
 
-#### 结构体
+##### 结构体
 
 每一个 `sync.Once` 结构体中都只包含一个用于标识代码块是否执行过的 `done` 以及一个互斥锁 `sync.Mutex`：
 
@@ -1055,7 +1055,7 @@ type Once struct {
 }
 ```
 
-#### 接口
+##### 接口
 
 `sync.Once.Do` 是 `sync.Once` 结构体对外唯一暴露的方法，该方法会接收一个入参为空的函数：
 
@@ -1086,7 +1086,7 @@ func (o *Once) doSlow(f func()) {
 
 `sync.Once` 会通过成员变量 `done` 确保函数不会执行第二次。
 
-#### 小结
+##### 小结
 
 作为用于保证函数执行次数的 `sync.Once` 结构体，它使用互斥锁和 `sync/atomic` 包提供的方法实现了某个函数在程序运行期间只能执行一次的语义。在使用该结构体时，也需要注意以下的问题：
 
@@ -1095,7 +1095,7 @@ func (o *Once) doSlow(f func()) {
 
 
 
-### Cond
+#### Cond
 
 Go 语言标准库中还包含条件变量 `sync.Cond`，它可以**让一组的 Goroutine 都在满足特定条件时被唤醒**。
 
@@ -1150,7 +1150,7 @@ listen
 
 **Cond 条件广播**
 
-#### 结构体
+##### 结构体
 
 `sync.Cond` 的结构体中包含以下 4 个字段：
 
@@ -1183,9 +1183,9 @@ type notifyList struct {
 
 在 `sync.notifyList`结构体中，`head` 和 `tail` 分别指向的链表的头和尾，`wait` 和 `notify` 分别表示当前正在等待的和已经通知到的 Goroutine 的索引。
 
-#### 接口
+##### 接口
 
-##### Goroutine 陷入休眠
+###### Goroutine 陷入休眠
 
 `sync.Cond` 对外暴露的 `sync.Cond.Wait` 方法会将当前 Goroutine 陷入休眠状态，它的执行过程分成以下两个步骤：
 
@@ -1233,7 +1233,7 @@ func notifyListWait(l *notifyList, t uint32) {
 
 **Cond 条件通知列表**
 
-##### 唤醒休眠的 Goroutine
+###### 唤醒休眠的 Goroutine
 
 `sync.Cond.Signal`和 `sync.Cond.Broadcast` 就是用来唤醒陷入休眠的 Goroutine 的方法，它们的实现有一些细微的差别：
 
@@ -1306,7 +1306,7 @@ Goroutine 的唤醒顺序也是按照**加入队列的先后顺序**，先加入
 
 在一般情况下，都会先调用 `sync.Cond.Wait` 陷入休眠等待满足期望条件，当满足唤醒条件时，就可以选择使用 `sync.Cond.Signal`或者 `sync.Cond.Broadcast` 唤醒一个或者全部的 Goroutine。
 
-#### 小结
+##### 小结
 
 `sync.Cond` 不是一个常用的同步机制，但是**在条件长时间无法满足时**，与使用 `for {}` 进行忙碌等待相比，`sync.Cond` 能够让出处理器的使用权，提高 CPU 的利用率。使用时也需要注意以下问题：
 
@@ -1316,7 +1316,7 @@ Goroutine 的唤醒顺序也是按照**加入队列的先后顺序**，先加入
 
 
 
-## 扩展原语
+### 扩展原语
 
 除了标准库中提供的同步原语之外，Go 语言还在子仓库 [sync](https://github.com/golang/sync) 中提供了四种扩展原语，`golang/sync/errgroup.Group`、`golang/sync/semaphore.Weighted`、`golang/sync/singleflight.Group` 和 `golang/sync/syncmap.Map`，其中的 `golang/sync/syncmap.Map` 在 1.9 版本中被移植到了标准库中。
 
@@ -1326,7 +1326,7 @@ Goroutine 的唤醒顺序也是按照**加入队列的先后顺序**，先加入
 
 介绍 Go 语言在扩展包中提供的三种同步原语，也就是 `golang/sync/errgroup.Group`、`golang/sync/semaphore.Weighted` 和 `golang/sync/singleflight.Group`。
 
-### ErrGroup
+#### ErrGroup
 
 `golang/sync/errgroup.Group` 在一组 Goroutine 中提供了同步、错误传播以及上下文取消的功能，可以使用如下所示的方式**并行获取网页的数据**：
 
@@ -1356,7 +1356,7 @@ if err := g.Wait(); err == nil {
 - 如果返回错误 — 这一组 Goroutine 最少返回一个错误；
 - 如果返回空值 — 所有 Goroutine 都成功执行；
 
-#### 结构体
+##### 结构体
 
 `golang/sync/errgroup.Group` 结构体同时由三个比较重要的部分组成：
 
@@ -1378,7 +1378,7 @@ type Group struct {
 
 这些字段共同组成了 `golang/sync/errgroup.Group` 结构体并提供同步、错误传播以及上下文取消等功能。
 
-#### 接口
+##### 接口
 
 通过 `golang/sync/errgroup.WithContext` 构造器创建新的 `golang/sync/errgroup.Group` 结构体：
 
@@ -1426,7 +1426,7 @@ func (g *Group) Wait() error {
 
 另一个用于等待的 `golang/sync/errgroup.Group.Wait` 方法只是调用了 `sync.WaitGroup.Wait`，在子任务全部完成时取消 `context.Context` 并返回可能出现的错误。
 
-#### 小结
+##### 小结
 
 `golang/sync/errgroup.Group` 的实现没有涉及底层和运行时包中的 API，它只是对基本同步语义进行了封装以提供更加复杂的功能。在使用时也需要注意下面几个问题：
 
@@ -1435,7 +1435,7 @@ func (g *Group) Wait() error {
 
 
 
-### Semaphore
+#### Semaphore
 
 信号量是在并发编程中常见的一种同步机制，在需要**控制访问资源的进程数量时就会用到信号量**，它会保证持有的计数器在 0 到初始化的权重之间波动。
 
@@ -1449,7 +1449,7 @@ Go 语言的扩展包中就提供了**带权重的信号量** `golang/sync/semap
 - `golang/sync/semaphore.Weighted.TryAcquire` 非阻塞地获取指定权重的资源，如果当前没有空闲资源，会直接返回 `false`；
 - `golang/sync/semaphore.Weighted.Release` 用于释放指定权重的资源；
 
-#### 结构体
+##### 结构体
 
 `golang/sync/semaphore.NewWeighted` 方法能根据传入的最大权重创建一个指向 `golang/sync/semaphore.Weighted` 结构体的指针：
 
@@ -1476,7 +1476,7 @@ type Weighted struct {
 
 信号量中的计数器会随着用户对资源的访问和释放进行改变，引入的权重概念能够提供更细粒度的资源的访问控制，尽可能满足常见的用例。
 
-#### 获取
+##### 获取
 
 `golang/sync/semaphore.Weighted.Acquire` 方法能用于获取指定权重的资源，其中包含三种不同情况：
 
@@ -1539,7 +1539,7 @@ func (s *Weighted) TryAcquire(n int64) bool {
 
 因为 `golang/sync/semaphore.Weighted.TryAcquire` 不会等待资源的释放，所以可能更适用于一些延时敏感、用户需要立刻感知结果的场景。
 
-#### 释放
+##### 释放
 
 当要释放信号量时，`golang/sync/semaphore.Weighted.Release` 方法会从头到尾遍历 `waiters` 列表中全部的等待者，如果释放资源后的信号量有充足的剩余资源就会通过 Channel 唤起指定的 Goroutine：
 
@@ -1569,7 +1569,7 @@ func (s *Weighted) Release(n int64) {
 
 通过对 `golang/sync/semaphore.Weighted.Release` 的分析能发现，如果一个信号量需要的占用的资源非常多，它可能会**长时间无法获取锁**，这也是 `golang/sync/semaphore.Weighted.Acquire` 引入上下文参数的原因，即为信号量的获取设置超时时间。
 
-#### 小结
+##### 小结
 
 带权重的信号量确实有着更多的应用场景，这也是 Go 语言对外提供的唯一一种信号量实现，在使用的过程中需要注意以下的几个问题：
 
@@ -1579,7 +1579,7 @@ func (s *Weighted) Release(n int64) {
 
 
 
-### SingleFlight
+#### SingleFlight
 
 `golang/sync/singleflight.Group` 是 Go 语言扩展包中提供了另一种同步原语，它能够**在一个服务中抑制对下游的多次重复请求**。
 
@@ -1621,7 +1621,7 @@ func (s *service) handleRequest(ctx context.Context, request Request) (Response,
 
 因为请求的哈希在业务上一般表示相同的请求，所以上述代码使用它作为请求的键。当然，也可以选择其他的字段作为 `golang/sync/singleflight.Group.Do` 方法的第一个参数减少重复的请求。
 
-#### 结构体
+##### 结构体
 
 `golang/sync/singleflight.Group` 结构体由一个互斥锁 `sync.Mutex` 和一个映射表组成，每一个 `golang/sync/singleflight.call` 结构体都保存了当前调用对应的信息：
 
@@ -1645,7 +1645,7 @@ type call struct {
 
 `golang/sync/singleflight.call` 结构体中的 `val` 和 `err` 字段都只会在执行传入的函数时，赋值一次并在 `sync.WaitGroup.Wait` 返回时被读取；`dups` 和 `chans` 两个字段分别存储了抑制的请求数量以及用于同步结果的 Channel。
 
-#### 接口
+##### 接口
 
 `golang/sync/singleflight.Group` 提供了两个用于抑制相同请求的方法：
 
@@ -1741,7 +1741,7 @@ func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result
 
 `golang/sync/singleflight.Group.Do` 和 `golang/sync/singleflight.Group.DoChan` 分别提供了同步和异步的调用方式，这让使用起来也更加灵活。
 
-#### 小结
+##### 小结
 
 当需要减少对下游的相同请求时，可以使用 `golang/sync/singleflight.Group` 来增加吞吐量和服务质量，不过在使用的过程中也需要注意以下的几个问题：
 
@@ -1749,13 +1749,13 @@ func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result
 - `golang/sync/singleflight.Group.Forget` 可以通知 `golang/sync/singleflight.Group` 在持有的映射表中删除某个键，接下来对该键的调用就不会等待前面的函数返回了；
 - 一旦调用的函数返回了错误，所有在等待的 Goroutine 也都会接收到同样的错误；
 
-## 小结
+### 小结
 
 介绍了 Go 语言标准库中提供的基本原语以及扩展包中的扩展原语，这些并发编程的原语能够更好地利用 Go 语言的特性构建高吞吐量、低延时的服务、解决并发带来的问题。
 
 在设计同步原语时，不仅要考虑 API 接口的易用、解决并发编程中可能遇到的线程竞争问题，还需要对尾延时进行优化，保证公平性，理解同步原语也是理解并发编程无法跨越的一个步骤。
 
-## 参考
+### 参考
 
 - “sync: allow inlining the Mutex.Lock fast path” https://github.com/golang/go/commit/41cb0aedffdf4c5087de82710c4d016a3634b4ac
 - “sync: allow inlining the Mutex.Unlock fast path” https://github.com/golang/go/commit/4c3f26076b6a9853bcc3c7d7e43726c044ac028a#diff-daec021895d1400f2c064a3e851c0d2c
@@ -5397,9 +5397,257 @@ func sysmon() {
 
 
 
+## Go 的并发方案
+
+学习最后一个语法知识：Go 并发。
+
+Go 的设计者敏锐地把握了 CPU 向多核方向发展的这一趋势，在决定去创建 Go 语 言的时候，果断将面向多核、原生支持并发作为了 Go 语言的设计目标之一，并将面向并发作为 Go 的设计哲学。
+
+当 Go 语言首次对外发布时，对并发的原生支持成为了 Go 最令开发者着迷的语法特性之一。 
+
+那么，怎么去学习 Go 并发呢？方法是将“Go 并发”这个词拆开来看，它包含两方面 内容，一个是并发的概念，另一个是 Go 针对并发设计给出的自身的实现方案，也就是 goroutine、channel、select 这些 Go 并发的语法特性。
+
+先来了解什么是并发，以及 Go 并发方案中最重要的概念，也就是 goroutine，围绕它基本用法和注意事项，对 Go 并发有一个基本的了解入。 
+
+### 什么是并发？ 
+
+经常提到并发（concurrency）这个词，那究竟什么是并发呢？它又与并行（parallelism）有什么区别呢？要想搞清楚这些问题，需要简单回顾一下操作系统的基本调度单元的变迁，以及计算机处理器的演化对应用设计的影响。 
+
+#### 单进程应用
+
+很久以前，面向大众消费者的主流处理器（CPU）都是单核的，操作系统的基本调度与执行单元是进程（process）。这个时候，用户层的应用有两种设计方式，一种是单进程应用，也就是每次启动一个应用，操作系统都只启动一个进程来运行这个应用。 
+
+单进程应用的情况下，用户层应用、操作系统进程以及处理器之间的关系是这样的：
+
+![image-20220125170516793](go_concurrent.assets/image-20220125170516793.png)
+
+可以看到，这个设计下，每个单进程应用对应一个操作系统进程，操作系统内的多个进程按时间片大小，被轮流调度到仅有的一颗单核处理器上执行。换句话说，这颗单核处理器在某个时刻只能执行一个进程对应的程序代码，两个进程不存在并行执行的可能。
+
+这里说的并行（parallelism），指的就是在同一时刻，有两个或两个以上的任务（这里指进程）的代码在处理器上执行。从这个概念也可以知道，多个处理器或多核处理器是并行执行的必要条件。 
+
+总的来说，单进程应用的设计比较简单，它的内部仅有一条代码执行流，代码从头执行到尾，不存在竞态，无需考虑同步问题。 
+
+#### 多进程应用
+
+用户层的另外一种设计方式，就是多进程应用，也就是应用通过 fork 等系统调用创建多个子进程，共同实现应用的功能。多进程应用的情况下，用户层应用、操作系统进程以及处理器之间的关系是这样的：
+
+![image-20220125170554767](go_concurrent.assets/image-20220125170554767.png)
+
+以图中的 App1 为例，这个应用设计者将应用内部划分为多个模块，每个模块用一个进程承载执行，每个模块都是一个单独的执行流，这样，App1 内部就有了多个独立的代码执行流。 
+
+但限于当前仅有一颗单核处理器，这些进程（执行流）依旧无法并行执行，无论是 App1 内部的某个模块对应的进程，还是其他 App 对应的进程，都得逐个按时间片被操作系统调度到处理器上执行。 
+
+粗略看起来，多进程应用与单进程应用相比并没有什么质的提升。那为什么还要将应用设计为多进程呢？
+
+这更多是从应用的结构角度去考虑的，多进程应用由于将功能职责做了划分，并指定专门的模块来负责，所以从结构上来看，要比单进程更为清晰简洁，可读性与可维护性也更好。
+
+这种将程序分成多个可独立执行的部分的结构化程序的设计方法，就是**并发设计**。采用了并发设计的应用也可以看成是一组独立执行的模块的组合。 
+
+不过，进程并不适合用于承载采用了并发设计的应用的模块执行流。因为进程是操作系统中资源拥有的基本单位，它不仅包含应用的代码和数据，还有系统级的资源，比如文件描述符、内存地址空间等等。
+
+进程的“包袱”太重，这导致它的创建、切换与撤销的代价都很大。 
+
+#### 多线程应用
+
+于是线程便走入了人们的视野，线程就是运行于进程上下文中的更轻量级的执行流。同时随着处理器技术的发展，多核处理器硬件成为了主流，这让真正的并行成为了可能，于是主流的应用设计模型变成了这样：
+
+![image-20220125170630184](go_concurrent.assets/image-20220125170630184.png)
+
+可以看到，基于线程的应用通常采用**单进程多线程的模型**，一个应用对应一个进程，应用通过并发设计将自己划分为多个模块，每个模块由一个线程独立承载执行。
+
+多个线程共享这个进程所拥有的资源，但线程作为执行单元可被独立调度到处理器上运行。 线程的创建、切换与撤销的代价相对于进程是要小得多。当这个应用的多个线程同时被调度到不同的处理器核上执行时，就说**这个应用是并行的**。
+
+#### 并发与并行
+
+讲到这里，可以**对并发与并行两个概念**做一些区分了。就像 Go 语言之父 Rob Pike 曾说过那样：**并发不是并行，并发关乎结构，并行关乎执行**。
+
+结合上面的例子，可以看到，并发是在应用设计与实现阶段要考虑的问题。并发考虑的是如何将应用划分为多个互相配合的、可独立执行的模块的问题。采用并发设计的程序并不一定是并行执行的。 
+
+在不满足并行必要条件的情况下（也就是仅有一个单核 CPU 的情况下），即便是采用并发设计的程序，依旧不可以并行执行。
+
+而在满足并行必要条件的情况下，采用并发设计的程序是可以并行执行的。而那些没有采用并发设计的应用程序，除非是启动多个程序实例， 否则是无法并行执行的。 
+
+在**多核处理器**成为主流的时代，即使采用并发设计的应用程序以单实例的方式运行，其中的每个内部模块也都是运行于一个单独的线程中的，多核资源也可以得到充分利用。
+
+而且，并发让并行变得更加容易，采用并发设计的应用可以将负载自然扩展到各个 CPU 核上，从而提升处理器的利用效率。 
+
+#### 传统并发程序设计
+
+在传统编程语言（如 C、C++ 等）中，基于多线程模型的应用设计就是一种典型的并发程序设计。但传统编程语言并非面向并发而生，没有对并发设计提供过多的帮助。并且，这些语言多以操作系统线程作为承载分解后的代码片段（模块）的执行单元，由操作系统执行调度。
+
+这种传统支持并发的方式有很多不足： 首先就是**复杂**。 
+
+创建容易退出难。如果做过 C/C++ 编程，那肯定知道，如果要利用 libpthread 库中提供的 API 创建一个线程，虽然要传入的参数个数不少，但好歹还是可以接受的。
+
+但一旦涉及线程的退出，就要考虑新创建的线程是否要与主线程分离（detach），还是需要主线程等待子线程终止（join）并获取其终止状态？又或者是否需要在新线程中设置取消点 （cancel point）来保证被主线程取消（cancel）的时候能顺利退出。 
+
+而且，并发执行单元间的通信困难且易错。多个线程之间的通信虽然有多种机制可选，但用起来也是相当复杂。并且一旦涉及共享内存，就会用到各种锁互斥机制，死锁便成为家常便饭。另外，线程栈大小也需要设定，开发人员需要选择使用默认的，还是自定义设置。
+
+第二就是**难于规模化（scale）**。 
+
+线程的使用代价虽然已经比进程小了很多，但依然不能大量创建线程，因为除了每个线程占用的资源不小之外，操作系统调度切换线程的代价也不小。 
+
+对于很多网络服务程序来说，由于不能大量创建线程，只能选择在少量线程里做网络多路复用的方案，也就是使用 epoll/kqueue/IoCompletionPort 这套机制，即便有像 libevent和 libev这样的第三方库帮忙，写起这样的程序也是很不容易的，存在大量钩子回调，给开发人员带来不小的心智负担。 
+
+那么以“原生支持并发”著称的 Go 语言在并发方面的实现方案又是什么呢？相对于基于线程的并发设计模型又有哪些改善呢？接下来看一下。
+
+### Go 的并发方案：goroutine 
+
+Go 并没有使用操作系统线程作为承载分解后的代码片段（模块）的基本执行单元，而是实现了goroutine这一由 Go 运行时（runtime）负责调度的、轻量的用户级线程，为并发程序设计提供原生支持。 
+
+先来看看这一方案有啥优势。相比传统操作系统线程来说，goroutine 的优势主要 是：
+
+- 资源占用小，每个 goroutine 的初始栈大小仅为 2k； 
+
+  - >当调度器的 `gFree` 和处理器的 `gFree` 列表都不存在结构体时，运行时会调用 [`runtime.malg`](https://draveness.me/golang/tree/runtime.malg) 初始化新的 [`runtime.g`](https://draveness.me/golang/tree/runtime.g) 结构，如果申请的堆栈大小大于 0，这里会通过 [`runtime.stackalloc`](https://draveness.me/golang/tree/runtime.stackalloc) 分配 2KB 的栈空间：
+
+- 由 Go 运行时而不是操作系统调度，goroutine 上下文切换在用户层完成，开销更小； 
+
+- 在语言层面而不是通过标准库提供。goroutine 由go关键字创建，一退出就会被回收或销毁，开发体验更佳； 
+
+- 语言内置 channel 作为 goroutine 间通信原语，为并发设计提供了强大支撑。
+
+和传统编程语言不同的是，Go 语言是面向并发而生的，所以，在程序的结构设计阶段，Go 的惯例是优先考虑并发设计。这样做的目的更多是考虑随着外界环境的变化， 通过并发设计的 Go 应用可以更好地、更自然地适应规模化（scale）。 
+
+比如，当应用被分配到更多计算资源，或者计算处理硬件增配后，Go 应用不需要再进行结构调整，就可以充分利用新增的计算资源。而且，经过并发设计后的 Go 应用也会更加契合 Gopher 们的开发分工协作。 
+
+接下来，来看看在 Go 中究竟如何使用 goroutine。
+
+#### goroutine 的基本用法 
+
+并发是一种能力，它让程序可以由若干个代码片段组合而成，并且每个片段都是独立运行的。goroutine 恰恰就是 Go 原生支持并发的一个具体实现。无论是 Go 自身运行时代码还是用户层 Go 代码，都无一例外地运行在 goroutine 中。 
+
+##### 创建
+
+首先来**创建一个 goroutine**。 
+
+Go 语言通过 go关键字+函数/方法 的方式创建一个 goroutine。创建后，新 goroutine 将拥有独立的代码执行流，并与创建它的 goroutine 一起被 Go 运行时调度。 
+
+这里给出了一些创建 goroutine 的代码示例：
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	go fmt.Println("I am a goroutine")
+
+	var c = make(chan int)
+	go func(a, b int) {
+		c <- a + b
+	}(3, 4)
+
+	// $GOROOT/src/net/http/server.go
+	c := srv.newConn(rw)
+	go c.serve(connCtx)
+
+	println(<-c)
+	time.Sleep(2000 * time.Second)
+}
+```
+
+通过 go 关键字，可以基于已有的具名函数 / 方法创建 goroutine，也可以基于匿名函数 / 闭包创建 goroutine。 
+
+曾说过，创建 goroutine 后，go 关键字不会返回 goroutine id 之类的唯一标识 goroutine 的 id，也不要尝试去得到这样的 id 并依赖它。另外，和线程一样，一个应用内部启动的所有 goroutine 共享进程空间的资源，如果多个 goroutine 访 问同一块内存数据，将会存在竞争，需要进行 goroutine 间的同步。
+
+##### 退出
+
+了解了怎么创建，那怎么退出 goroutine 呢？ 
+
+goroutine 的使用代价很低，Go 官方也推荐多多使用 goroutine。而且，多数情况下， 不需要考虑对 goroutine 的退出进行控制：goroutine 的执行函数的返回，就意味着 goroutine 退出。 
+
+如果 main goroutine 退出了，那么也意味着整个应用程序的退出。此外，还要注意的是，goroutine 执行的函数或方法即便有返回值，Go 也会忽略这些返回值。所以，如果要获取 goroutine 执行后的返回值，需要另行考虑其他方法，比如通过 goroutine 间的通信来实现。 
+
+接下来就来说说 goroutine 间的通信方式。 
+
+#### goroutine 间的通信 
+
+传统的编程语言（比如：C++、Java、Python 等）并非面向并发而生的，所以他们面对并发的逻辑多是基于操作系统的线程。并发的执行单元（线程）之间的通信，利用的也是操作系统提供的线程或进程间通信的原语，比如：共享内存、信号（signal）、管道 （pipe）、消息队列、套接字（socket）等。 
+
+在这些通信原语中，使用最多、最广泛的（也是最高效的）是结合了线程同步原语（比如：锁以及更为低级的原子操作）的共享内存方式，因此，可以说**传统语言的并发模型是基于对内存的共享的**。 
+
+不过，这种传统的基于共享内存的并发模型很难用，且易错，尤其是在大型或复杂程序中，开发人员在设计并发程序时，需要根据线程模型对程序进行建模，同时规划线程之间的通信方式。
+
+如果选择的是高效的基于共享内存的机制，那么还要花费大量心思设计线程间的同步机制，并且在设计同步机制的时候，还要考虑多线程间复杂的内存管理，以及如何防止死锁等情况。 
+
+这种情况下，开发人员承受着巨大的心智负担，并且基于这类传统并发模型的程序难于编写、阅读、理解和维护。一旦程序发生问题，查找 Bug 的过程更是漫长和艰辛。 
+
+但 Go 语言就不一样了！Go 语言从设计伊始，就将解决上面这个传统并发模型的问题作为 Go 的一个目标，并在新并发模型设计中借鉴了著名计算机科学家 Tony Hoare 提出的 **CSP（Communicationing Sequential Processes，通信顺序进程）并发模型**。 
+
+Tony Hoare 的 CSP 模型旨在简化并发程序的编写，让并发程序的编写与编写顺序程序一样简单。Tony Hoare 认为输入输出应该是基本的编程原语，数据处理逻辑（也就是 CSP 中的 P）只需调用输入原语获取数据，顺序地处理数据，并将结果数据通过输出原语输出就可以了。 
+
+因此，在 Tony Hoare 眼中，**一个符合 CSP 模型的并发程序应该是一组通过输入输出原语连接起来的 P 的集合**。从这个角度来看，CSP 理论不仅是一个并发参考模型，也是一种并发程序的程序组织方法。
+
+它的组合思想与 Go 的设计哲学不谋而合。 Tony Hoare 的 CSP 理论中的 P，也就是“Process（进程）”，是一个抽象概念，它代表任何顺序处理逻辑的封装，它获取输入数据（或从其他 P 的输出获取），并生产出可以被其他 P 消费的输出数据。
+
+这里可以简单看下 CSP 通信模型的示意图：
+
+![image-20220125173054170](go_concurrent.assets/image-20220125173054170.png)
+
+注意了，这里的 P 并不一定与操作系统的进程或线程划等号。在 Go 中，与“Process”对应的是 goroutine。
+
+为了实现 CSP 并发模型中的输入和输出原语，Go 还引入了 goroutine（P）之间的通信原语channel。goroutine 可以从 channel 获取输入数据， 再将处理后得到的结果数据通过 channel 输出。
+
+通过 channel 将 goroutine（P）组合连接在一起，让设计和编写大型并发系统变得更加简单和清晰，再也不用为那些传统共享内存并发模型中的问题而伤脑筋了。
+
+比如上面提到的获取 goroutine 的退出状态，就可以使用 channel 原语实现：
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+func spawn(f func() error) <-chan error {
+	c := make(chan error)
+	go func() {
+		c <- f()
+	}()
+  
+	return c
+}
+
+func main() {
+	c := spawn(func() error {
+		time.Sleep(2 * time.Second)
+		return errors.New("timeout")
+	})
+	fmt.Println(<-c)
+}
+```
+
+这个示例在 main goroutine 与子 goroutine 之间建立了一个元素类型为 error 的 channel，子 goroutine 退出时，会将它执行的函数的错误返回值写入这个 channel， main goroutine 可以通过读取 channel 的值来获取子 goroutine 的退出状态。 
+
+虽然 CSP 模型已经成为 Go 语言支持的主流并发模型，但 Go 也支持传统的、基于共享内存的并发模型，并提供了基本的低级别同步原语（主要是 sync 包中的互斥锁、条件变量、 读写锁、原子操作等）。 
+
+那么在实践中应该选择哪个模型的并发原语呢？是使用 channel，还是在低级同步原语保护下的共享内存呢？ 
+
+毫无疑问，从程序的整体结构来看，Go 始终推荐以 CSP 并发模型风格构建并发程序，尤其是在复杂的业务层面，这能提升程序的逻辑清晰度，大大降低并发设计的复杂性，并让程序更具可读性和可维护性。 
+
+不过，对于局部情况，比如涉及性能敏感的区域或需要保护的结构体数据时，可以使用更为高效的低级同步原语（如 mutex），保证 goroutine 对数据的同步访问。
+
+### 小结 
+
+开始了对 Go 并发的学习，了解了并发的含义，以及并发与并行两个概念的区别。
+
+一定要记住：并发不是并行。并发是应用结构设计相关的概念，而并行只是程序执行期的概念，并行的必要条件是具有多个处理器或多核处理器，否则无论是否是并发的设计，程序执行时都有且仅有一个任务可以被调度到处理器上执行。 
+
+传统的编程语言（比如：C、C++）的并发程序设计方案是基于操作系统的线程调度模型的，这种模型与操作系统的调度强耦合，并且对于开发人员来说十分复杂，开发体验较差并且易错。 
+
+而 Go 给出的并发方案是基于轻量级线程 goroutine 的。goroutine 占用的资源非常小， 创建、切换以及销毁的开销很小。
+
+并且 Go 在语法层面原生支持基于 goroutine 的并发， 通过一个 go 关键字便可以轻松创建 goroutine，goroutine 占用的资源非常小，创建、 切换以及销毁的开销很小。这给开发者带来极佳的开发体验。 
 
 
 
+## Goroutine调度器
 
 
 
