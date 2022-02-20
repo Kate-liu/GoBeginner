@@ -189,6 +189,13 @@ ok      github.com/Kate-liu/GoBeginner/gointerface/interfacedefinitionsource    
 
 
 
+### GO 测试覆盖率
+
+```sh
+$go test -cover . 
+ok      github.com/Kate-liu/GoBeginner/practiceproject/webtcpserver/webtcpserversimple/frame    0.005s  coverage: 91.3% of statements
+```
+
 
 
 
