@@ -198,6 +198,28 @@ ok      github.com/Kate-liu/GoBeginner/practiceproject/webtcpserver/webtcpserver
 
 
 
+### Go module
+
+清除掉本地的 module cache。
+
+```go
+go clean -modcache
+```
+
+go list 查是否有可升级的 module 版本。
+
+```go
+go list -m -u all
+```
+
+通过设置 GONOPROXY 来让 go list 查询 引入module 的源仓库而不是代理服务器上的缓存。
+
+```go
+GONOPROXY="bitbucket.org/bigwhite/m1" go list -m -u all
+```
+
+
+
 
 
 ## C 命令行工具
