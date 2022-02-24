@@ -334,7 +334,41 @@ $git checkout go1.3 // 切换到go 1.3版本
 # 使用 checkout 进行版本的切换
 ```
 
+### Git 将https的remote origin转为ssh方式
 
+- 查看当前remote
+
+git remote -v
+
+- 切换到http：
+
+git remote set-url https://github.com/username/repository.git
+
+- 切换到ssh：
+
+git remote set-url git@github.com:username/repository.git
+
+### Git使用，回退版本过多，查看所有的提交版本
+
+由于最近几次的提交出现问题，需要强行回退之前的多个版本
+
+直接使用：Git reset --hard xxxxxxxxxxxxxxx
+
+突然发现，回退之后，最后提交的几次，数据丢失了，需要重新回退到中间的某个版本
+
+直接使用：git log 是看不到中间的日志记录的
+
+需要使用：git reflog
+
+### Mac 使用 Git 出错
+
+xcrun: error: invalid active developer path (/Library/Developer/CommandLineTools), missing xcrun at: /Library/Developer/CommandLineTools/usr/bin/xcrun
+
+解决方法
+
+终端输入
+
+xcode-select --install
 
 
 
