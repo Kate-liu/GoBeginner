@@ -6,52 +6,68 @@ Learn Go program with a beginner's mind.
 
 ### Install
 
-- Install go
+- Install Go
   - [Install_go.md](./installgo/install_go.md)
 - Install IDE
   - [install_IDE.md](installIDE/install_IDE.md)
 
 ### Hello
 
-- Hello world
+- Hello World
   - [hello_world.md](helloworld/hello_world.md)
 
 ### Go Program
 
-- Go init
+- Go Init
   - [init_go.md](goinit/init_go.md)
-- Go module
+- Go Module
   - [go_module.md](gomodule/go_module.md)
-- Go const
-- Go variable
-- Go controlstructure
-- Go languagetype
-- Go languagefeature
-- Go method
-- Go function
-- Go interface
+- Go Const
+  - [go_const.md](goconst/go_const.md)
+- Go Variable
+  - [variable_declaration.md](govariable/variabledeclaration/variable_declaration.md)
+  - [variable_block_scope.md](govariable/variableblockscope/variable_block_scope.md)
+- Go Control Structure
+  - [go_control_structure.md](gocontrolstructure/go_control_structure.md)
+- Go Language Type
+  - [go_language_base_data_type.md](golanguagetype/basedatatype/go_language_base_data_type.md)
+  - [go_language_compound_data_type.md](golanguagetype/compounddatatype/go_language_compound_data_type.md)
+- Go Language Feature
+  - [design_philosophy.md](golanguagefeature/designphilosophy/design_philosophy.md)
+  - [project_layout.md](golanguagefeature/projectlayout/project_layout.md)
+  - [go_1.17_new_feature.md](golanguagefeature/go1.17newfeatures/go_1.17_new_feature.md)
+  - [go_generic.md](golanguagefeature/gogeneric/go_generic.md)
+- Go Method
+  - [go_method.md](gomethod/go_method.md)
+- Go Function
+  - [go_function.md](gofunction/go_function.md)
+- Go Interface
+  - [go_interface.md](gointerface/go_interface.md)
 - Go reflect
-- Go concurrent
-- Go gc
-- Go geekcode
-- Go generic
-
-
+  - [go_reflect.md](goreflect/go_reflect.md)
+- Go Concurrent
+  - [go_concurrent.md](goconcurrent/go_concurrent.md)
+- Go GC
+  - [go_gc.md](gogc/go_gc.md)
+- Go Geek Code
+  - [go_geek_code.md](gogeekcode/go_geek_code.md)
 
 ### Project
 
-- function trace chain
-- web server project
-- light weight thread pool
-- web tcp server
-
-
+- Function Trace Chain
+  - [function_trace_chain.md](practiceproject/functiontracechain/function_trace_chain.md)
+- Web Server Project
+  - [web_server_project.md](practiceproject/webserverproject/web_server_project.md)
+- Light Weight Thread Pool
+  - [light_weight_thread_pool.md](practiceproject/lightweightthreadpool/light_weight_thread_pool.md)
+- Web Tcp Server
+  - [web_tcp_server.md](practiceproject/webtcpserver/web_tcp_server.md)
 
 ### Tool
 
 - Tools
   - [tools.md](tools/tools.md)
-- hash algorithm
+- Hash Algorithm
   - [hash_algorithm.md](tools/hash_algorithm.md)
 
 ## Book
