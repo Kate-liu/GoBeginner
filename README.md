@@ -70,6 +70,11 @@ Learn Go program with a beginner's mind.
 - Hash Algorithm
   - [hash_algorithm.md](tools/hash_algorithm.md)
 
+## Advancd
+
+- Go Advanced
+  - [go_advanced.md](goadvanced/go_advanced.md)
+
 ## Book
 
 - 《Go 程序设计语言》- 人手一本的 Go 语言“圣经”
@@ -91,8 +96,6 @@ Learn Go program with a beginner's mind.
   - [Go 入门指南](https://github.com/Unknwon/the-way-to-go_ZH_CN)
 - 《Go语言编程》
   - [豆瓣 Go语言编程](https://book.douban.com/subject/11577300/)
-
-
 
 ## Reference
 
